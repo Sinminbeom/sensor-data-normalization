@@ -27,6 +27,29 @@ class ProcessCategory(AppCategory):
 
     def register_category(self) -> None:
         self.cate_reg_queue[E_CATE.NORMALIZER] = lambda: self.register_normalizer()
+        self.cate_reg_queue[E_CATE.COMMUNICATION] = lambda: (
+            self.register_communication()
+        )
+
+    def register_communication(self) -> None:
+        communication = CategoryGroup()
+        common = CategoryGroup()
+        common.push(
+            E_CATE.E_COMMUNICATION.E_COMMON.E_REQUEST_CONSUMER[E_CATE_META_ELE.NAME],
+            CategoryAction(
+                E_CATE.E_COMMUNICATION.E_COMMON.E_REQUEST_CONSUMER[
+                    E_CATE_META_ELE.LAMBDA
+                ]
+            ),
+        )
+        common.push(
+            E_CATE.E_COMMUNICATION.E_COMMON.E_NOTIFIER[E_CATE_META_ELE.NAME],
+            CategoryAction(
+                E_CATE.E_COMMUNICATION.E_COMMON.E_NOTIFIER[E_CATE_META_ELE.LAMBDA]
+            ),
+        )
+        communication.push(E_CATE.E_COMMUNICATION.COMMON, common)
+        self.cate_queue[E_CATE.COMMUNICATION] = communication
 
     def register_normalizer(self) -> None:
         normalizer = CategoryGroup()

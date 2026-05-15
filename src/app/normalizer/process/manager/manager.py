@@ -3,17 +3,15 @@
 책임:
 1. 입력 캐시 스토리지에서 파일 목록 수집 → push_shared_job_queue 로 jobQueue 적재
 2. ModuleStatusTracker 로 모든 모듈 종료 감지 → 잔여 미페어 sweep + 업로드
-3. 런타임 argv(build_num/date/vehicle_id) 는 ClassVar로 보유 (main 에서 configure 호출,
-   fork 시 자식 프로세스가 inherit)
+3. 런타임 컨텍스트(request_id/date_folder/vehicle_id/selected_device) 는 ClassVar로
+   보유 (daemon main 에서 configure 호출, fork 시 자식 프로세스가 inherit)
 """
 
-import json
 import logging
 import os
 import time
 from typing import ClassVar
 
-import requests
 from python_library.process.queue_process import QueueProcessing
 from python_library.storage.s3.s3_storage_factory import S3StorageFactory
 from python_library.storage.s3.s3_storage_info_factory import S3StorageInfoFactory
@@ -30,9 +28,10 @@ from sensor_category.sensor_registry import SensorRegistry
 
 
 class NormalizerManager(QueueProcessing):
-    _BUILD_NUM: ClassVar[str] = ""
+    _REQUEST_ID: ClassVar[str] = ""
     _DATE_FOLDER: ClassVar[str] = ""
     _VEHICLE_ID: ClassVar[str] = ""
+    _SELECTED_DEVICE: ClassVar[str] = ""
 
     def __init__(self, app_name: str, process_name: str):
         super().__init__(name=process_name)
@@ -51,11 +50,18 @@ class NormalizerManager(QueueProcessing):
         self._initialized = False
 
     @classmethod
-    def configure(cls, build_num: str, date_folder: str, vehicle_id: str) -> None:
-        """main()에서 호출. fork된 자식 프로세스가 ClassVar로 inherit."""
-        cls._BUILD_NUM = build_num
+    def configure(
+        cls,
+        request_id: str,
+        date_folder: str,
+        vehicle_id: str,
+        selected_device: str,
+    ) -> None:
+        """daemon main()에서 호출. fork된 자식 프로세스가 ClassVar로 inherit."""
+        cls._REQUEST_ID = request_id
         cls._DATE_FOLDER = date_folder
         cls._VEHICLE_ID = vehicle_id
+        cls._SELECTED_DEVICE = selected_device
 
     # ---------- lifecycle ----------
 
@@ -68,10 +74,14 @@ class NormalizerManager(QueueProcessing):
         self._storage.connect()
 
         file_list = self._collect_file_list()
-        self._enqueue_jobs_by_device_filter(file_list, self._config.selected_device)
+        self._enqueue_jobs_by_device_filter(
+            file_list, NormalizerManager._SELECTED_DEVICE
+        )
 
         self._initialized = True
-        self._logger.info(f"pid={os.getpid()} || manager init")
+        self._logger.info(
+            f"pid={os.getpid()} || manager init (request_id={NormalizerManager._REQUEST_ID})"
+        )
 
     def action(self) -> None:
         if not self._initialized:
@@ -92,11 +102,10 @@ class NormalizerManager(QueueProcessing):
 
             time.sleep(0.1)
         except Exception as e:
-            self._logger.error(f"pid={os.getpid()} || errMsg={e}")
+            self._logger.exception(f"pid={os.getpid()} || manager errMsg={e}")
             try:
                 self._storage.disconnect()
             finally:
-                self._post_error(e)
                 self.stop()
 
     # ---------- file collection ----------
@@ -108,7 +117,6 @@ class NormalizerManager(QueueProcessing):
 
         if not self._storage.is_exists(process_folder):
             self._logger.error(f"path not exists: {process_folder}")
-            self._post_error(FileNotFoundError(process_folder))
             self._storage.disconnect()
             self.stop()
             return []
@@ -164,19 +172,3 @@ class NormalizerManager(QueueProcessing):
 
     def _build_storage(self) -> IStorage:
         return S3StorageFactory(S3StorageInfoFactory()).create_storage()
-
-    def _post_error(self, err: Exception) -> None:
-        url = (
-            f"{self._config.rest_base_url}/error/{NormalizerManager._BUILD_NUM}"
-            f"/{self._config.project_name}/{NormalizerManager._VEHICLE_ID}"
-            f"/{NormalizerManager._DATE_FOLDER}"
-        )
-        try:
-            requests.post(
-                url,
-                data=json.dumps({"message": str(err)}),
-                headers={"Content-Type": "application/json; charset=utf-8"},
-                timeout=5,
-            )
-        except Exception:
-            self._logger.exception("error report failed")
