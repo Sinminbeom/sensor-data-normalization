@@ -1,11 +1,4 @@
-"""split PCAP 파일명 파서.
-
-원본 매핑 (swm → 신규):
-- utils/Utils.py::Utils.GetSplitPcapFileName(name)
-    → PcapFilenameParser.parse(pcap_file_name) -> PcapFilenameParts
-  반환을 tuple (moduleName, date, hours, minutes)에서 @dataclass로 변경.
-  second(SS) 필드 추가 — swm 원본은 storageHandler 내부에서 별도 추출하던 값을 통합.
-"""
+"""split PCAP 파일명 파서."""
 
 from dataclasses import dataclass
 

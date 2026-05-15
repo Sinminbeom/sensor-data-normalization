@@ -2,16 +2,6 @@
 
 sensor-data-replayer 의 streamer_app.py / downloader_app.py 와 동일 구조.
 
-원본 매핑 (swm → 신규):
-- sensor-data-normalization.py::main(argv)               → main()
-- argv (buildNum, date, vehicleId, processSize)
-    → --build-num, --date, --vehicle-id, --process-size
-- main 의 replayerPreProcesser(...) 인자 직접 주입
-    → NormalizerManager.configure(...) ClassVar (fork 시 자식이 inherit)
-- main 의 storageHandler 반복 append
-    → ProcessCategory.register_normalizer() (매니저 1 + 모듈 N 동시 등록)
-- rp.StartMp() / rp.Run()
-    → MultiProcessManager.start() + Normalizer.run() (얇은 lifecycle)
 """
 
 import argparse

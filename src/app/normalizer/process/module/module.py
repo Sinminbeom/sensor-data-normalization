@@ -1,36 +1,4 @@
-"""NormalizerModule — PCAP 다운로드/분할/업로드 모듈 프로세스 (워커).
-
-원본 매핑 (swm → 신규):
-- pcapNormalization/storageHandler.py::storageHandler(cShardPairQueueProcess)
-    → NormalizerModule(QueueProcessing)
-- sensor-data-replayer 의 app/<service>/process/module/module.py 위치·역할에 정렬.
-  매니저(NormalizerManager) 와 모듈(NormalizerModule) 두 단계 패턴.
-- 메서드 매핑:
-    Init                                       → on_init() (action 첫 진입에서 1회)
-    Running(process) 본체 (while isRunning)    → action() (QueueProcessing 루프)
-    _download                                  → _download
-    _splitPcap                                 → _split_pcap
-    _upload                                    → _upload_processed
-    _pushUnProcessedPcapsInShardPairQueue      → _push_unprocessed_to_pair_buckets
-    _mergePcapFiles                            → _merge_pair
-    _getDownloadDstPath                        → _build_download_dst_path
-    _getSplitOutFileTemplate                   → _build_split_out_template
-    _makeUploadDstPath                         → _build_upload_dst_path
-    _makePairKey                               → _build_pair_key
-    _makeOutFilePath                           → _build_unpaired_out_path
-    _getModuleType                             → _get_module_type
-    postError                                  → _post_error
-- 외부 의존 변경:
-    cHadoopStorage                            → python_library.storage.IStorage (LocalStorage)
-    cSplitsPcaps/cSplitedPcaps                → pcap.splitter.IPcapSplitter / SplitedPcap (추상)
-    ConfigureManager                          → ProjectConfig
-    Log.Log                                   → python logging
-    cShardPairQueueProcess (자체 큐 관리)      → QueueProcessing (python_library, shared_job_queue 자동 결선)
-    SharedQueues (자체 정의)                   → 라이브러리 shared_job_queue + PairBuckets (pair 검출만 남김)
-- 종료 신호:
-    swm의 eSubProcessStatus.END 통보
-        → ModuleStatusTracker.mark_finished(name) + self.stop()
-"""
+"""NormalizerModule — PCAP 다운로드/분할/업로드 모듈 프로세스 (워커)."""
 
 import json
 import logging
@@ -39,18 +7,20 @@ import time
 
 import requests
 from python_library.process.queue_process import QueueProcessing
+from python_library.storage.s3.s3_storage_factory import S3StorageFactory
+from python_library.storage.s3.s3_storage_info_factory import S3StorageInfoFactory
 from python_library.storage.storage import IStorage, StorageFile
 
-from app.normalizer.queue.module_status import ModuleStatusTracker
-from app.normalizer.queue.pair_buckets import PairBuckets
+from common.process_state.module_status import ModuleStatusTracker
+from common.process_state.pair_buckets import PairBuckets
 from config.project_config import ProjectConfig
+from pcap.local_pcap_splitter import LocalPcapSplitter
 from pcap.packet_position import E_PACKET_POSITION
-from pcap.splitter import IPcapSplitter, SplitedPcap
+from pcap.pcap_filename_parser import PcapFilenameParser
+from pcap.splitter import IPcapSplitter, SplitedPcap, SplitOutcome
 from pcap.unprocessed_pcap import UnprocessedPcap
 from sensor_category.enum_sensor import E_SENSOR_TYPE
 from sensor_category.sensor_registry import SensorRegistry
-from storage.storage_object_property import StorageObjectProperty
-from utils.pcap_filename_parser import PcapFilenameParser
 
 
 class NormalizerModule(QueueProcessing):
@@ -78,8 +48,7 @@ class NormalizerModule(QueueProcessing):
         self._storage = self._build_storage()
         self._storage.connect()
 
-        # TODO: 구체 PcapSplitter 구현체 결합. 후속 작업에서 LocalPcapSplitter 등 주입.
-        # self._splitter = LocalPcapSplitter()
+        self._splitter = self._build_splitter()
 
         self._initialized = True
         self._logger.info(f"pid={os.getpid()} || {self._process_name} init")
@@ -115,39 +84,35 @@ class NormalizerModule(QueueProcessing):
     # ---------- job (jobQueue → download → split → upload) ----------
 
     def _process_file(self, file_obj: StorageFile) -> None:
-        storage_obj = StorageObjectProperty(
-            file_obj.get_file_path(), file_obj.get_file_name()
-        )
-        vehicle_id = storage_obj.vehicle_id
+        file_path = file_obj.get_file_path()
+        file_name = file_obj.get_file_name()
+        # path 의 마지막 segment 가 vehicle_id 라는 도메인 컨벤션
+        # (`{cache_root}/{date_folder}/{vehicle_id}/{file_name}`).
+        vehicle_id = file_path.split("/")[-1]
 
-        self._download(storage_obj)
-        outcome = self._split_pcap(storage_obj)
+        self._download(file_path, file_name, vehicle_id)
+        outcome = self._split_pcap(file_name, vehicle_id)
 
         self._upload_processed(vehicle_id, outcome.processed)
         self._push_unprocessed_to_pair_buckets(vehicle_id, outcome.unprocessed)
 
-        parts = PcapFilenameParser.parse(storage_obj.file_name)
+        parts = PcapFilenameParser.parse(file_name)
         module_type = self._get_module_type(parts.module_name)
         if module_type in (E_SENSOR_TYPE.CAMERA, E_SENSOR_TYPE.GNSS):
             time.sleep(0.01)
 
-    def _download(self, storage_obj: StorageObjectProperty) -> None:
+    def _download(self, file_path: str, file_name: str, vehicle_id: str) -> None:
         assert self._storage is not None
-        download_dst_path = self._build_download_dst_path(
-            storage_obj.vehicle_id, storage_obj.file_name
-        )
-        self._storage.download(storage_obj.download_src_path, download_dst_path)
+        download_dst_path = self._build_download_dst_path(vehicle_id, file_name)
+        self._storage.download(f"{file_path}/{file_name}", download_dst_path)
 
-    def _split_pcap(self, storage_obj: StorageObjectProperty):
+    def _split_pcap(self, file_name: str, vehicle_id: str) -> SplitOutcome:
         assert self._splitter is not None
-        file_name = storage_obj.file_name
-        vehicle_id = storage_obj.vehicle_id
-
         download_dst_path = self._build_download_dst_path(vehicle_id, file_name)
         split_src_file = f"{download_dst_path}/{file_name}"
         split_out_template = self._build_split_out_template(vehicle_id, file_name)
 
-        outcome = self._splitter.split_once(split_src_file, split_out_template, None)
+        outcome = self._splitter.split_once(split_src_file, split_out_template)
 
         if os.path.isfile(split_src_file):
             os.remove(split_src_file)
@@ -192,11 +157,12 @@ class NormalizerModule(QueueProcessing):
 
     def _merge_pair(self, paired_list: list[UnprocessedPcap]) -> None:
         assert self._storage is not None
+        assert self._splitter is not None
         pcap_files = [item.src_path for item in paired_list]
         out_file_path = paired_list[0].out_file_path
         prefix_path = paired_list[0].prefix_path
 
-        IPcapSplitter.merge_pcap_files(pcap_files, out_file_path)  # type: ignore[abstract]
+        self._splitter.merge_pcap_files(pcap_files, out_file_path)
         self._storage.upload(out_file_path, prefix_path)
 
         if os.path.isfile(out_file_path):
@@ -258,14 +224,14 @@ class NormalizerModule(QueueProcessing):
     # ---------- helpers ----------
 
     def _get_module_type(self, module_name: str) -> str:
-        args = SensorRegistry.instance().get_sensor_args(module_name.upper())
-        return args.sensor_type
+        return SensorRegistry.instance().get_sensor_type(module_name.upper())
 
     def _build_storage(self) -> IStorage:
-        # NOTE: 후속 Task에서 LocalStorageFactory 결선.
-        raise NotImplementedError(
-            "LocalStorage 결선은 후속 Task. 본 Task는 IStorage 결합만 정렬."
-        )
+        # S3 표준 credential chain (환경변수 / ~/.aws/credentials / IAM role) 을 boto3 가 자동 인식.
+        return S3StorageFactory(S3StorageInfoFactory()).create_storage()
+
+    def _build_splitter(self) -> IPcapSplitter:
+        return LocalPcapSplitter()
 
     def _post_error(self, err: Exception) -> None:
         url = (

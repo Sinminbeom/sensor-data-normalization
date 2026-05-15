@@ -1,24 +1,4 @@
-"""ProjectConfig — application.conf 값 접근.
-
-원본 매핑 (swm → 신규):
-- Configure/ConfigureManager.ConfigureManager.instance()              → ProjectConfig (singleton)
-- config/constants.py::ConfigPath ("./config/config.conf")            → DEFAULT_CONFIG_PATH ("./conf/application.conf")
-
-application.conf 섹션·키 매핑 (swm config.conf → 신규 application.conf):
-- [Setting].DownloadDstPath                  → [STORAGE_CACHE].ROOT + PREFIX
-- [Setting].SplitDstPath                     → [STORAGE].ROOT + PREFIX
-- [Setting].UnProcessedMergeOutFilePath      → [STORAGE_UNPAIRED_MERGE].ROOT + PREFIX
-- swm argv processSize                       → [NORMALIZER].WORKER_COUNT
-- [RestAPI].BaseUrl                          → [REST].BASE_URL
-- [RestAPI].ProjectName                      → [COMMON].PROJECT_NAME
-- [SelectedDevice].SelectedDevice            → [SELECTED_DEVICE].SELECTED
-- [Log].* 섹션은 logging.conf로 일원화하며 ProjectConfig에는 별도 키 없음.
-
-스토리지 백엔드 정책 변경:
-- swm은 [Hadoop] / [MinIO] 직접 설정으로 외부 ObjectStorage2 라이브러리에 결합.
-- 신규는 python_library.storage.local.LocalStorageFactory를 사용하는 단일 로컬 백엔드.
-- 후속 작업에서 S3 등으로 교체 시 conf에 별도 섹션 추가 + storage_factory 분기 예정.
-"""
+"""ProjectConfig — application.conf 값 접근."""
 
 from python_library.configure.app_config import AppConfig
 from python_library.define.enum import IENUM

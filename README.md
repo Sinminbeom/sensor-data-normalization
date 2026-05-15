@@ -1,9 +1,6 @@
 # sensor-data-normalization
 
-PCAP 기반 센서 데이터 정규화 파이프라인. python-library를 의존성으로 사용하며,
-[sensor-data-replayer](https://github.com/Sinminbeom/sensor-data-replayer) 와 동일한
-코드 스타일(Python 3.11+, uv + hatchling, src layout, `MultiProcessManagerAppFromCate`
-패턴)을 따른다.
+PCAP 기반 센서 데이터 정규화 파이프라인.
 
 ## 빌드 / 실행
 
@@ -29,30 +26,30 @@ sensor-data-normalization/
 │   ├── normalizer_app.py                # 진입점
 │   ├── app/
 │   │   ├── app_object.py                # IApp / abApp / MultiProcessManagerApp[FromCate]
-│   │   └── normalizer/
-│   │       ├── queue/
-│   │       │   ├── pair_buckets.py      # HEAD/TAIL 쌍 누적 (jobQueue는 python_library가 자동 결선)
-│   │       │   └── module_status.py     # 모듈 종료 추적 (매니저가 polling)
-│   │       └── process/
-│   │           ├── manager/manager.py   # NormalizerManager (QueueProcessing, 파일 수집·잔여 sweep)
-│   │           └── module/module.py     # NormalizerModule (QueueProcessing, 다운로드/분할/업로드)
+│   │   └── normalizer/process/
+│   │       ├── manager/manager.py       # NormalizerManager (QueueProcessing, 파일 수집·잔여 sweep)
+│   │       └── module/module.py         # NormalizerModule (QueueProcessing, 다운로드/분할/업로드)
+│   ├── common/process_state/
+│   │   ├── pair_buckets.py              # HEAD/TAIL 쌍 누적 (cross-process 공유)
+│   │   └── module_status.py             # 모듈 종료 추적 (cross-process 공유)
 │   ├── process_category/
 │   │   ├── enum_category.py             # E_CATE.NORMALIZER
 │   │   └── process_category.py          # register_normalizer (워커 N 동적 push)
 │   ├── sensor_category/
 │   │   ├── enum_sensor.py               # E_SENSOR_TYPE, E_LIDAR, E_CAMERA, E_GNSS
-│   │   ├── sensor.py                    # 센서 타입별 모듈 목록 (mutable)
-│   │   ├── sensor_args.py               # @dataclass(frozen=True) SensorArgs
-│   │   └── sensor_registry.py           # SensorRegistry 싱글톤 (모듈명 → SensorArgs)
+│   │   └── sensor_registry.py           # SensorRegistry 싱글톤 (모듈명 → sensor_type)
 │   ├── config/
 │   │   └── project_config.py            # ProjectConfig (AppConfig 상속)
-│   ├── pcap/
+│   ├── pcap/                            # replayer src/pcaps/ 차용 + 응용 추가
+│   │   ├── headers/{file_header,packet_header}.py     # 24B FileHeader / 16B PacketHeader (time_stamp)
+│   │   ├── body/{ethernet,linux_sll*,ip_header,pcap_body*}.py  # protocol layer parse
+│   │   ├── reader/{single,multi}.py     # PcapReader (file/packet header + body parse)
+│   │   ├── {packet,pool,time_info,constants}.py
 │   │   ├── packet_position.py           # E_PACKET_POSITION (HEAD/MID/TAIL)
 │   │   ├── splitter.py                  # IPcapSplitter / SplitedPcap / SplitOutcome
+│   │   ├── local_pcap_splitter.py       # LocalPcapSplitter (1초 split + merge, raw bytes 기반)
+│   │   ├── pcap_filename_parser.py      # PcapFilenameParser (파일명 → module/date/hours/minutes)
 │   │   └── unprocessed_pcap.py          # @dataclass(frozen=True) UnprocessedPcap
-│   ├── storage/
-│   │   └── storage_object_property.py   # @dataclass(frozen=True) StorageObjectProperty
-│   └── utils/                           # collection_utils, pcap_filename_parser
 └── pyproject.toml
 ```
 
@@ -75,45 +72,9 @@ sensor-data-normalization/
    - `ModuleStatusTracker.all_finished(expected_count)` polling
    - 모든 모듈 종료되면 `PairBuckets.pop_all_remaining()` 잔여 sweep → 업로드 → disconnect → stop
 
-## 차량 식별자 명명 규칙
-
-차량 식별자는 `VEHICLE-NNN`(예: `VEHICLE-001`) 형식. 외부 입력(`--vehicle-id`,
-S3 객체 경로 등)에서 이 형식을 기대한다. 코드 안에 하드코딩된 차량 식별자는
-존재하지 않는다.
-
-## 스토리지 백엔드
-
-본 Task 범위에서는 스토리지 추상화(`python_library.storage.IStorage`)만 결선되어
-있고, 구체 구현(LocalStorage / S3) 결선은 후속 작업으로 분리. `Normalizer` 와
-`NormalizerWorker` 의 `_build_storage()` 가 현재 `NotImplementedError` 를 던지는
-이유다.
-
 ## 동시성 모델
 
 multi-process 채택. 벤치마크(`scripts/bench_io_vs_cpu.py`) 결과 합성 IO+CPU 워크로드에서
 process가 thread 대비 모든 worker count(1/2/4/8)에서 동등 또는 우세 (Python 표준
 파일 IO가 의외로 GIL-bound이기 때문). 워커 결선·종료는 `python_library.MultiProcessManager`
 의 자동 결선(`set_shared_job_queue` / `set_shared_queue` / `join`)을 그대로 사용.
-
-## swm 원본과의 매핑
-
-각 파일 상단의 모듈 docstring에 swm 원본 파일·심볼 매핑이 명시되어 있다.
-주요 매핑 요약:
-
-| swm 원본 | 신규 |
-| --- | --- |
-| `sensor-data-normalization.py` | `src/normalizer_app.py` (얇은 `Normalizer` wrapper) |
-| `pcapNormalization/replayerPreProcesser.py` | `src/app/normalizer/process/manager/manager.py` (`QueueProcessing` 상속) |
-| `pcapNormalization/storageHandler.py` | `src/app/normalizer/process/module/module.py` (`QueueProcessing` 상속) |
-| `App/cPairQueueMultiProcessor.py` 의 jobQueue | `python_library.MultiProcessManager.shared_job_queue` (자동 결선) |
-| `App/cPairQueueMultiProcessor.py` 의 pairQueue | `src/app/normalizer/queue/pair_buckets.py` |
-| swm 의 `eSubProcessStatus` 통보 | `src/app/normalizer/queue/module_status.py` |
-| `App/Category/eSensor.py` (enum) | `src/sensor_category/enum_sensor.py` |
-| `App/Category/eSensor.py::EC_SENSOR` (싱글톤) | `src/sensor_category/sensor_registry.py` |
-| `App/Category/cSensorArgs.py` | `src/sensor_category/sensor_args.py` |
-| `App/Category/cSensorDTO.py` | `src/sensor_category/sensor.py` |
-| `App/cStorageObjectPropertyDTO.py` | `src/storage/storage_object_property.py` |
-| `App/cUnProcessedPcapDTO.py` | `src/pcap/unprocessed_pcap.py` |
-| `App/cDefine.py::ePacketPosition` | `src/pcap/packet_position.py::E_PACKET_POSITION` |
-| `Configure/ConfigureManager` | `src/config/project_config.py` |
-| `utils/Utils.py::Utils.GetSplitPcapFileName` | `src/utils/pcap_filename_parser.py::PcapFilenameParser.parse` |

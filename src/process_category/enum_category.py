@@ -1,12 +1,4 @@
-"""프로세스 카테고리 enum.
-
-원본 매핑 (swm → 신규):
-- swm에는 카테고리 enum 자체가 없다 (main에서 replayerPreProcesser·storageHandler 직접 생성).
-- sensor-data-replayer 의 E_CATE 패턴(STREAMER/DOWNLOADER 등)을 따라 E_CATE.NORMALIZER 추가.
-- 두 단계 구성:
-    E_CATE.NORMALIZER.COMMON.NORMALIZER_MANAGER  — replayerPreProcesser 역할 (오케스트레이터)
-    E_CATE.NORMALIZER.MODULE.NORMALIZER_MODULE   — storageHandler 역할 (워커 N개)
-"""
+"""프로세스 카테고리 enum."""
 
 from python_library.define.enum import IENUM
 

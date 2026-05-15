@@ -1,11 +1,4 @@
-"""모듈 프로세스 종료 추적용 싱글톤.
-
-원본 매핑 (swm → 신규):
-- App/cPairQueueMultiProcessor.py 의 process status 통보 부분만 분리
-    → ModuleStatusTracker (별도 객체. PairBuckets 와 분리: 단일 책임)
-- swm의 eSubProcessStatus.END → ModuleStatusTracker.END_TOKEN
-- 매니저(NormalizerManager) 가 expected_count 와 비교해 모든 모듈 종료 여부 판정.
-"""
+"""모듈 프로세스 종료 추적용 싱글톤."""
 
 from multiprocessing import Manager
 from typing import Any, ClassVar

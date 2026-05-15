@@ -1,12 +1,5 @@
 """HEAD/TAIL 쌍 누적 버킷 (pair_key → 조각 리스트).
 
-원본 매핑 (swm → 신규):
-- App/cPairQueueMultiProcessor.py 의 pair 큐 부분만 분리
-    → PairBuckets (jobQueue / 워커 상태 추적은 python_library.MultiProcessManager
-      가 자동 결선해 주므로 본 객체에서 제거)
-- PutShardPairQueueWithLock / PopShardPairQueue → put / pop_complete
-- PopUnPairedData → pop_all_remaining
-
 설계:
 - multiprocessing.Manager().dict() + Lock 으로 워커 프로세스 간 공유.
 - put(pair_key, item) 호출 후 같은 key의 누적이 2개 도달하면 그 리스트를 반환
