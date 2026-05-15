@@ -1,0 +1,54 @@
+[project]
+name = "sensor-data-normalization"
+version = "0.1.0"
+description = "sensor-data-normalization"
+requires-python = ">=3.14"
+dependencies = [
+    "python-library",
+    "requests>=2.32.5",
+]
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.5.0",
+    "pyright>=1.1.407",
+    "pytest>=9.0.1",
+    "pytest-cov>=7.0.0",
+    "ruff>=0.14.6",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP"]
+# E501: formatter가 처리
+# N801: E_* enum 명명 (python-library / sensor-data-replayer 팀 컨벤션)
+ignore = ["E501", "N801"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pyright]
+pythonVersion = "3.14"
+typeCheckingMode = "basic"
+executionEnvironments = [{ root = "src" }]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = ["-q", "--cov=src"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build]
+sources = ["src"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.uv.sources]
+python-library = { git = "ssh://git@personal-github/Sinminbeom/python-library.git", tag = "v2.11.1" }
