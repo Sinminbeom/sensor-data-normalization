@@ -15,7 +15,8 @@ class ProjectConfig(AppConfig):
         STORAGE_CACHE = "STORAGE_CACHE"
         STORAGE_UNPAIRED_MERGE = "STORAGE_UNPAIRED_MERGE"
         NORMALIZER = "NORMALIZER"
-        REST = "REST"
+        REDIS = "REDIS"
+        NOTIFICATION = "NOTIFICATION"
         SELECTED_DEVICE = "SELECTED_DEVICE"
 
     class E_CATE_ELE_COMMON(IENUM):
@@ -29,8 +30,15 @@ class ProjectConfig(AppConfig):
     class E_CATE_ELE_NORMALIZER(IENUM):
         WORKER_COUNT = "WORKER_COUNT"
 
-    class E_CATE_ELE_REST(IENUM):
-        BASE_URL = "BASE_URL"
+    class E_CATE_ELE_REDIS(IENUM):
+        HOST = "HOST"
+        PORT = "PORT"
+        CHANNEL_NAME = "CHANNEL_NAME"
+        RECEIVER = "RECEIVER"
+
+    class E_CATE_ELE_NOTIFICATION(IENUM):
+        WEBHOOK_URL = "WEBHOOK_URL"
+        DEFAULT_CHANNEL = "DEFAULT_CHANNEL"
 
     class E_CATE_ELE_SELECTED_DEVICE(IENUM):
         SELECTED = "SELECTED"
@@ -77,8 +85,30 @@ class ProjectConfig(AppConfig):
             )
         )
 
-        self.rest_base_url = self.get_config(
-            ProjectConfig.E_CATE_TYPE.REST, ProjectConfig.E_CATE_ELE_REST.BASE_URL
+        self.redis_host = self.get_config(
+            ProjectConfig.E_CATE_TYPE.REDIS, ProjectConfig.E_CATE_ELE_REDIS.HOST
+        )
+        self.redis_port = int(
+            self.get_config(
+                ProjectConfig.E_CATE_TYPE.REDIS, ProjectConfig.E_CATE_ELE_REDIS.PORT
+            )
+        )
+        self.redis_channel_name = self.get_config(
+            ProjectConfig.E_CATE_TYPE.REDIS,
+            ProjectConfig.E_CATE_ELE_REDIS.CHANNEL_NAME,
+        )
+        self.redis_receiver = self.get_config(
+            ProjectConfig.E_CATE_TYPE.REDIS,
+            ProjectConfig.E_CATE_ELE_REDIS.RECEIVER,
+        )
+
+        self.notification_webhook_url = self.get_config(
+            ProjectConfig.E_CATE_TYPE.NOTIFICATION,
+            ProjectConfig.E_CATE_ELE_NOTIFICATION.WEBHOOK_URL,
+        )
+        self.notification_default_channel = self.get_config(
+            ProjectConfig.E_CATE_TYPE.NOTIFICATION,
+            ProjectConfig.E_CATE_ELE_NOTIFICATION.DEFAULT_CHANNEL,
         )
 
         self.selected_device = self.get_config(

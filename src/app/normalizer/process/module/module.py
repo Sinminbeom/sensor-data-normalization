@@ -1,11 +1,9 @@
 """NormalizerModule — PCAP 다운로드/분할/업로드 모듈 프로세스 (워커)."""
 
-import json
 import logging
 import os
 import time
 
-import requests
 from python_library.process.queue_process import QueueProcessing
 from python_library.storage.s3.s3_storage_factory import S3StorageFactory
 from python_library.storage.s3.s3_storage_info_factory import S3StorageInfoFactory
@@ -78,7 +76,6 @@ class NormalizerModule(QueueProcessing):
                 self._storage.disconnect()
             finally:
                 self._status_tracker.mark_finished(self._process_name)
-                self._post_error(e)
                 self.stop()
 
     # ---------- job (jobQueue → download → split → upload) ----------
@@ -232,18 +229,3 @@ class NormalizerModule(QueueProcessing):
 
     def _build_splitter(self) -> IPcapSplitter:
         return LocalPcapSplitter()
-
-    def _post_error(self, err: Exception) -> None:
-        url = (
-            f"{self._config.rest_base_url}/error/{self._config.project_name}"
-            f"/{self._process_name}"
-        )
-        try:
-            requests.post(
-                url,
-                data=json.dumps({"message": str(err)}),
-                headers={"Content-Type": "application/json; charset=utf-8"},
-                timeout=5,
-            )
-        except Exception:
-            self._logger.exception("error report failed")
