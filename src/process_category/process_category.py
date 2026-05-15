@@ -1,17 +1,18 @@
-"""ProcessCategory — 카테고리 트리 등록.
+"""ProcessCategory — 카테고리 트리 등록."""
 
-원본 매핑 (swm → 신규):
-- swm은 main에서 storageHandler N개를 AppendWithShardPairQueue로 직접 append.
-- 신규는 sensor-data-replayer의 ProcessCategory 패턴을 따라 cate_queue 트리로 등록.
-- 매니저 1 + 모듈 N 구성. 모듈 수(swm argv processSize)는 set_worker_count(N).
-"""
+from collections.abc import Callable
 
 from python_library.category.app_category import AppCategory
 from python_library.category.category_action import CategoryAction
 from python_library.category.category_component import ICategoryComponent
 from python_library.category.category_group import CategoryGroup
+from python_library.process.queue_process import IQueueProcess
 
 from process_category.enum_category import E_CATE, E_CATE_META_ELE
+
+# (name, factory) — factory(app_name, process_name) → 워커/매니저 프로세스 인스턴스.
+# E_CATE_META_ELE 의 [NAME=0, LAMBDA=1] 와 정렬.
+CategoryEntry = tuple[str, Callable[[str, str], IQueueProcess]]
 
 
 class ProcessCategory(AppCategory):
@@ -56,10 +57,10 @@ class ProcessCategory(AppCategory):
         normalizer.push(E_CATE.E_NORMALIZER.MODULE, module)
         self.cate_queue[E_CATE.NORMALIZER] = normalizer
 
-    def get_process_list_category(self, *cate: str) -> list[tuple]:
-        """E_CATE.NORMALIZER 같은 root 카테고리 키로부터 (name, lambda) 튜플 리스트 추출.
+    def get_process_list_category(self, *cate: str) -> list[CategoryEntry]:
+        """E_CATE.NORMALIZER 같은 root 카테고리 키로부터 (name, factory) 튜플 리스트 추출.
 
-        MultiProcessManagerAppFromCate 가 lambda(_app_name, _process_name)으로 프로세스
+        MultiProcessManagerAppFromCate 가 factory(_app_name, _process_name)으로 프로세스
         인스턴스를 만들 때 사용. 튜플 인덱스 [NAME=0, LAMBDA=1] 는 E_CATE_META_ELE 와 정렬.
         """
         if not cate:
@@ -67,11 +68,13 @@ class ProcessCategory(AppCategory):
         root = self.cate_queue.get(cate[0])
         if root is None:
             return []
-        result: list[tuple] = []
+        result: list[CategoryEntry] = []
         self._walk_actions(root, result)
         return result
 
-    def _walk_actions(self, component: ICategoryComponent, result: list[tuple]) -> None:
+    def _walk_actions(
+        self, component: ICategoryComponent, result: list[CategoryEntry]
+    ) -> None:
         if not isinstance(component, CategoryGroup):
             return
         for name, child in component._children.items():

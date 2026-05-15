@@ -1,12 +1,4 @@
-"""센서 enum 정의.
-
-원본 매핑 (swm → 신규):
-- App/Category/eSensor.py::E_SENSOR_TYPE → E_SENSOR_TYPE (그대로)
-- App/Category/eSensor.py::E_LIDAR      → E_LIDAR (그대로)
-- App/Category/eSensor.py::E_CAMERA     → E_CAMERA (그대로)
-- (swm에는 enum 클래스 없이 문자열만 사용하던 GNSS) → E_GNSS 추가
-싱글톤 등록자(swm의 EC_SENSOR)는 common/singleton/sensor_registry.py로 분리.
-"""
+"""센서 enum 정의."""
 
 from python_library.define.enum import IENUM
 

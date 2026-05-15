@@ -1,12 +1,4 @@
-"""앱 베이스 클래스.
-
-원본 매핑 (swm → 신규):
-- App/IProcessManager.py::IProcessManager      → IApp
-- App/IProcessManager.py::abProcessManager     → abApp
-- App/IProcessManager.py::abMpProcessManager   → MultiProcessManagerApp
-- 카테고리 기반 자동 등록(swm에는 없음, replayer 신규 패턴) → MultiProcessManagerAppFromCate
-- Run() 루프(swm `while self.isRunning: OnRun()`) → run()/on_run() (snake_case)
-"""
+"""앱 베이스 클래스."""
 
 from abc import ABC, abstractmethod
 

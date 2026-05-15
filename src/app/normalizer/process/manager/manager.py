@@ -1,28 +1,10 @@
 """NormalizerManager — 정규화 파이프라인 오케스트레이터 프로세스.
 
-원본 매핑 (swm → 신규):
-- pcapNormalization/replayerPreProcesser.py::replayerPreProcesser(abMpProcessManager)
-    → NormalizerManager(QueueProcessing)
-- 메서드 매핑:
-    Init                  → on_init() (action 첫 진입에서 1회)
-    OnRun (단일 사이클)   → action()
-    _getFileList          → _collect_file_list
-    _checkDir             → _check_dir
-    _processFiles         → _enqueue_jobs_by_device_filter
-    _uploadUnPairedData   → _upload_unpaired
-    postError             → _post_error
-- sensor-data-replayer 의 app/<service>/process/manager/manager.py 위치·역할에 정렬.
-
 책임:
 1. 입력 캐시 스토리지에서 파일 목록 수집 → push_shared_job_queue 로 jobQueue 적재
 2. ModuleStatusTracker 로 모든 모듈 종료 감지 → 잔여 미페어 sweep + 업로드
 3. 런타임 argv(build_num/date/vehicle_id) 는 ClassVar로 보유 (main 에서 configure 호출,
    fork 시 자식 프로세스가 inherit)
-
-외부 의존:
-- cHadoopStorage              → python_library.storage.IStorage (LocalStorage)
-- ConfigureManager            → ProjectConfig
-- Log.Log                     → python logging
 """
 
 import json
@@ -33,14 +15,18 @@ from typing import ClassVar
 
 import requests
 from python_library.process.queue_process import QueueProcessing
+from python_library.storage.s3.s3_storage_factory import S3StorageFactory
+from python_library.storage.s3.s3_storage_info_factory import S3StorageInfoFactory
 from python_library.storage.storage import IStorage
+from python_library.storage.storage_file import StorageFile
 
-from app.normalizer.queue.module_status import ModuleStatusTracker
-from app.normalizer.queue.pair_buckets import PairBuckets
+from common.process_state.module_status import ModuleStatusTracker
+from common.process_state.pair_buckets import PairBuckets
 from config.project_config import ProjectConfig
+from pcap.pcap_filename_parser import PcapFilenameParser
+from pcap.unprocessed_pcap import UnprocessedPcap
 from sensor_category.enum_sensor import E_SENSOR_TYPE
 from sensor_category.sensor_registry import SensorRegistry
-from utils.pcap_filename_parser import PcapFilenameParser
 
 
 class NormalizerManager(QueueProcessing):
@@ -115,7 +101,7 @@ class NormalizerManager(QueueProcessing):
 
     # ---------- file collection ----------
 
-    def _collect_file_list(self) -> list:
+    def _collect_file_list(self) -> list[StorageFile]:
         assert self._storage is not None
         cache_root = self._config.get_cache_storage_full_path()
         process_folder = f"{cache_root}/{NormalizerManager._DATE_FOLDER}"
@@ -139,7 +125,7 @@ class NormalizerManager(QueueProcessing):
         return all_files
 
     def _enqueue_jobs_by_device_filter(
-        self, file_list: list, selected_device: str
+        self, file_list: list[StorageFile], selected_device: str
     ) -> None:
         for file_obj in file_list:
             file_name = file_obj.get_file_name()
@@ -151,9 +137,11 @@ class NormalizerManager(QueueProcessing):
                 continue
 
             parts = PcapFilenameParser.parse(file_name)
-            args = SensorRegistry.instance().get_sensor_args(parts.module_name.upper())
+            sensor_type = SensorRegistry.instance().get_sensor_type(
+                parts.module_name.upper()
+            )
 
-            if selected_device.upper() == args.sensor_type:
+            if selected_device.upper() == sensor_type:
                 self.push_shared_job_queue(file_obj)
                 continue
 
@@ -162,7 +150,7 @@ class NormalizerManager(QueueProcessing):
 
     # ---------- final upload ----------
 
-    def _upload_unpaired(self, unpaired: list[list]) -> None:
+    def _upload_unpaired(self, unpaired: list[list[UnprocessedPcap]]) -> None:
         assert self._storage is not None
         for bucket in unpaired:
             head = bucket[0]
@@ -175,10 +163,7 @@ class NormalizerManager(QueueProcessing):
     # ---------- helpers ----------
 
     def _build_storage(self) -> IStorage:
-        # NOTE: 후속 Task에서 LocalStorageFactory 결선.
-        raise NotImplementedError(
-            "LocalStorage 결선은 후속 Task. 본 Task는 IStorage 결합만 정렬."
-        )
+        return S3StorageFactory(S3StorageInfoFactory()).create_storage()
 
     def _post_error(self, err: Exception) -> None:
         url = (
