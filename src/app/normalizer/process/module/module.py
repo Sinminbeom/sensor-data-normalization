@@ -177,9 +177,11 @@ class NormalizerModule(QueueProcessing):
         return path
 
     def _build_split_out_template(self, vehicle_id: str, file_name: str) -> str:
+        # splitter 는 로컬 파일을 출력 (LocalPcapSplitter). base 는 cache (로컬). upload 시
+        # 이 로컬 결과를 _build_upload_dst_path (S3) 로 올린다.
         parts = PcapFilenameParser.parse(file_name)
         module_type = self._get_module_type(parts.module_name).lower()
-        base = self._config.get_storage_full_path()
+        base = self._config.get_cache_storage_full_path()
         return (
             f"{base}/{vehicle_id}/{module_type}/{parts.module_name}/"
             f"{parts.date}/{parts.hours}/{parts.minutes}/{parts.module_name}_{{}}.pcap"
