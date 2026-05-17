@@ -1,16 +1,20 @@
-"""NormalizerManager — 정규화 파이프라인 오케스트레이터 프로세스.
+"""NormalizerManager — 정규화 daemon 프로세스.
 
-책임:
-1. 입력 캐시 스토리지에서 파일 목록 수집 → push_shared_job_queue 로 jobQueue 적재
-2. ModuleStatusTracker 로 모든 모듈 종료 감지 → 잔여 미페어 sweep + 업로드
-3. 런타임 컨텍스트(request_id/date_folder/vehicle_id/selected_device) 는 ClassVar로
-   보유 (daemon main 에서 configure 호출, fork 시 자식 프로세스가 inherit)
+daemon 시작 시 한 번 fork → 영구 실행. 매 action() 마다:
+  1. Redis pub/sub 채널 poll (listener 합성)
+  2. 메시지가 자기 receiver 대상이면 cycle 진입:
+     - 파일 수집 → device 필터 → StorageFile 들을 shared_job_queue 에 push
+     - JobProgressTracker 카운터로 NormalizerModule × N 의 완료 감지
+     - PairBuckets 잔여 sweep
+     - Slack notify (notifier 합성)
+
+cycle 컨텍스트(request_id/date/vehicle_id/selected_device)는 cycle 동안만 살아 있는
+**instance field** 로 보유 (ClassVar 안티패턴 아님).
 """
 
 import logging
 import os
 import time
-from typing import ClassVar
 
 from python_library.process.queue_process import QueueProcessing
 from python_library.storage.s3.s3_storage_factory import S3StorageFactory
@@ -18,8 +22,14 @@ from python_library.storage.s3.s3_storage_info_factory import S3StorageInfoFacto
 from python_library.storage.storage import IStorage
 from python_library.storage.storage_file import StorageFile
 
-from common.process_state.module_status import ModuleStatusTracker
+from common.event_bus.listener.normalization_request_listener import (
+    NormalizationRequestListener,
+)
+from common.notification.notification_sender import INotificationSender
+from common.notification.slack_webhook_notifier import SlackWebhookNotifier
+from common.process_state.job_progress import JobProgressTracker
 from common.process_state.pair_buckets import PairBuckets
+from common.protocol.normalization_request import NormalizationRequest
 from config.project_config import ProjectConfig
 from pcap.pcap_filename_parser import PcapFilenameParser
 from pcap.unprocessed_pcap import UnprocessedPcap
@@ -28,10 +38,8 @@ from sensor_category.sensor_registry import SensorRegistry
 
 
 class NormalizerManager(QueueProcessing):
-    _REQUEST_ID: ClassVar[str] = ""
-    _DATE_FOLDER: ClassVar[str] = ""
-    _VEHICLE_ID: ClassVar[str] = ""
-    _SELECTED_DEVICE: ClassVar[str] = ""
+    _POLL_TIMEOUT_SEC = 1.0
+    _CYCLE_WAIT_INTERVAL_SEC = 0.1
 
     def __init__(self, app_name: str, process_name: str):
         super().__init__(name=process_name)
@@ -40,108 +48,115 @@ class NormalizerManager(QueueProcessing):
         self._logger = logging.getLogger(
             f"{ProjectConfig.LOGGER_BASE_NAME}.{process_name}"
         )
-        # 싱글톤은 fork 전 부모 프로세스에서 즉시 instance() 호출 →
-        # 자식이 inherit (Manager() proxy 포함).
+        # 싱글톤은 fork 전 부모 프로세스에서 즉시 instance() 호출 → 자식이 inherit.
         self._config = ProjectConfig.instance()
         self._pair_buckets = PairBuckets.instance()
-        self._status_tracker = ModuleStatusTracker.instance()
-        self._storage: IStorage | None = None
-        self._expected_modules = 0
-        self._initialized = False
+        self._progress = JobProgressTracker.instance()
 
-    @classmethod
-    def configure(
-        cls,
-        request_id: str,
-        date_folder: str,
-        vehicle_id: str,
-        selected_device: str,
-    ) -> None:
-        """daemon main()에서 호출. fork된 자식 프로세스가 ClassVar로 inherit."""
-        cls._REQUEST_ID = request_id
-        cls._DATE_FOLDER = date_folder
-        cls._VEHICLE_ID = vehicle_id
-        cls._SELECTED_DEVICE = selected_device
+        # 합성 (composition) — listener / notifier / storage 는 자식 프로세스 안에서 초기화.
+        self._storage: IStorage | None = None
+        self._listener: NormalizationRequestListener | None = None
+        self._notifier: INotificationSender | None = None
+        self._initialized = False
 
     # ---------- lifecycle ----------
 
     def on_init(self) -> None:
-        self._expected_modules = self._config.worker_count
-
         SensorRegistry.instance().register()
 
         self._storage = self._build_storage()
         self._storage.connect()
 
-        file_list = self._collect_file_list()
-        self._enqueue_jobs_by_device_filter(
-            file_list, NormalizerManager._SELECTED_DEVICE
-        )
+        self._listener = NormalizationRequestListener()
+        self._notifier = SlackWebhookNotifier()
 
         self._initialized = True
         self._logger.info(
-            f"pid={os.getpid()} || manager init (request_id={NormalizerManager._REQUEST_ID})"
+            f"pid={os.getpid()} || {self._process_name} init "
+            f"(workers={self._config.worker_count})"
         )
 
     def action(self) -> None:
         if not self._initialized:
             self.on_init()
 
-        assert self._storage is not None
+        assert self._listener is not None
+        request = self._listener.poll(timeout_sec=NormalizerManager._POLL_TIMEOUT_SEC)
+        if request is None:
+            return
+
+        self._handle_request(request)
+
+    # ---------- cycle ----------
+
+    def _handle_request(self, request: NormalizationRequest) -> None:
+        assert self._notifier is not None
+        selected_device = request.selected_device or self._config.selected_device
+        summary = (
+            f"date={request.date} "
+            f"vehicle_id={request.vehicle_id or 'ALL'} "
+            f"selected_device={selected_device}"
+        )
+        self._logger.info(f"[{request.request_id}] start | {summary}")
         try:
-            self._logger.info(
-                f"pid={os.getpid()} || size_shared_job_queue={self.size_shared_job_queue()}"
-            )
-
-            if self._status_tracker.all_finished(self._expected_modules):
-                self._logger.info(f"pid={os.getpid()} || all modules finished")
-                self._upload_unpaired(self._pair_buckets.pop_all_remaining())
-                self._storage.disconnect()
-                self.stop()
-                return
-
-            time.sleep(0.1)
+            self._run_cycle(request, selected_device)
+            self._notifier.notify_success(request.request_id, summary)
+            self._logger.info(f"[{request.request_id}] done")
         except Exception as e:
-            self._logger.exception(f"pid={os.getpid()} || manager errMsg={e}")
-            try:
-                self._storage.disconnect()
-            finally:
-                self.stop()
+            self._logger.exception(f"[{request.request_id}] pipeline failed")
+            self._notifier.notify_failure(request.request_id, summary, repr(e))
+
+    def _run_cycle(
+        self, request: NormalizationRequest, selected_device: str
+    ) -> None:
+        assert self._storage is not None
+        file_list = self._collect_file_list(request.date, request.vehicle_id)
+        jobs = self._filter_by_device(file_list, selected_device)
+
+        self._progress.begin_cycle(len(jobs))
+        for file_obj in jobs:
+            self.push_shared_job_queue(file_obj)
+
+        self._wait_for_completion()
+        self._upload_unpaired(self._pair_buckets.pop_all_remaining())
+
+    def _wait_for_completion(self) -> None:
+        while not self._progress.is_done():
+            if self.is_stop():
+                return
+            time.sleep(NormalizerManager._CYCLE_WAIT_INTERVAL_SEC)
 
     # ---------- file collection ----------
 
-    def _collect_file_list(self) -> list[StorageFile]:
+    def _collect_file_list(
+        self, date_folder: str, vehicle_id: str
+    ) -> list[StorageFile]:
         assert self._storage is not None
         cache_root = self._config.get_cache_storage_full_path()
-        process_folder = f"{cache_root}/{NormalizerManager._DATE_FOLDER}"
+        process_folder = f"{cache_root}/{date_folder}"
 
         if not self._storage.is_exists(process_folder):
             self._logger.error(f"path not exists: {process_folder}")
-            self._storage.disconnect()
-            self.stop()
             return []
 
         all_files = [
             f for f in self._storage.get_file_list(process_folder) if not f.is_dir()
         ]
-        if NormalizerManager._VEHICLE_ID:
-            return [
-                f
-                for f in all_files
-                if NormalizerManager._VEHICLE_ID in f.get_file_path()
-            ]
+        if vehicle_id:
+            return [f for f in all_files if vehicle_id in f.get_file_path()]
         return all_files
 
-    def _enqueue_jobs_by_device_filter(
+    def _filter_by_device(
         self, file_list: list[StorageFile], selected_device: str
-    ) -> None:
+    ) -> list[StorageFile]:
+        filtered: list[StorageFile] = []
         for file_obj in file_list:
             file_name = file_obj.get_file_name()
             if "temp" in file_name:
                 continue
 
             if selected_device == E_SENSOR_TYPE.ALL:
-                self.push_shared_job_queue(file_obj)
+                filtered.append(file_obj)
                 continue
 
             parts = PcapFilenameParser.parse(file_name)
@@ -150,11 +165,12 @@ class NormalizerManager(QueueProcessing):
             )
 
             if selected_device.upper() == sensor_type:
-                self.push_shared_job_queue(file_obj)
+                filtered.append(file_obj)
                 continue
 
             if selected_device.lower() in file_name:
-                self.push_shared_job_queue(file_obj)
+                filtered.append(file_obj)
+        return filtered
 
     # ---------- final upload ----------
 
