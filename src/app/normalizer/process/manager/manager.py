@@ -132,8 +132,8 @@ class NormalizerManager(QueueProcessing):
         self, date_folder: str, vehicle_id: str
     ) -> list[StorageFile]:
         assert self._storage is not None
-        cache_root = self._config.get_cache_storage_full_path()
-        process_folder = f"{cache_root}/{date_folder}"
+        raw_root = self._config.get_raw_storage_full_path()
+        process_folder = f"{raw_root}/{date_folder}"
 
         if not self._storage.is_exists(process_folder):
             self._logger.error(f"path not exists: {process_folder}")

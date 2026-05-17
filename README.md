@@ -82,22 +82,38 @@ flowchart LR
     Redis[(Redis Pub/Sub<br/>normalize_requests)]
     Slack["Slack Incoming<br/>Webhook"]
 
+    S3Raw[(S3 STORAGE_RAW<br/>read-only<br/>replayer 가 raw 업로드)]
+    LocalCache[("로컬 STORAGE_CACHE<br/>다운로드 + split 작업 디렉토리")]
+    S3Out[(S3 STORAGE<br/>1초 split 결과 출력)]
+
     subgraph App["E_CATE.NORMALIZER — daemon 시작 시 영구 fork (worker pool)"]
-        Manager["NormalizerManager<br/>① Redis pub/sub poll (listener 합성)<br/>② cycle 트리거 (파일 수집 + device 필터)<br/>③ job push + 완료 폴링<br/>④ 잔여 sweep + Slack notify (notifier 합성)"]
-        Modules["NormalizerModule × N<br/>stateless worker<br/>pop StorageFile<br/>다운로드 → 1초 split<br/>MID 업로드<br/>HEAD/TAIL → PairBuckets<br/>mark_one_done"]
-        Storage[(S3 Storage<br/>via python_library.IStorage)]
+        Manager["NormalizerManager<br/>① Redis pub/sub poll (listener 합성)<br/>② cycle 트리거 (RAW listing + device 필터)<br/>③ job push + 완료 폴링<br/>④ 잔여 sweep + Slack notify (notifier 합성)"]
+        Modules["NormalizerModule × N<br/>stateless worker<br/>pop StorageFile<br/>download(S3 RAW → 로컬 cache)<br/>1초 split (local)<br/>MID upload → S3 STORAGE<br/>HEAD/TAIL → PairBuckets<br/>mark_one_done"]
 
         Manager -- "push_shared_job_queue" --> Modules
         Modules -- "PairBuckets<br/>(pair_key 완성 시 merge)" --> Modules
         Manager <-- "JobProgressTracker<br/>(카운터)" --> Modules
-        Modules <--> Storage
-        Manager <--> Storage
     end
+
+    Manager -- "listing" --> S3Raw
+    S3Raw -- "download" --> Modules
+    Modules <--> LocalCache
+    Modules -- "upload" --> S3Out
+    Manager -- "잔여 merge upload" --> S3Out
 
     Trigger -- "PUBLISH" --> Redis
     Redis -- "SUBSCRIBE + receiver 필터" --> Manager
     Manager -- "cycle 완료 후 POST" --> Slack
 ```
+
+**스토리지 레이아웃 (conf/application.conf)**
+
+| conf | 역할 | 형식 | 예시 |
+|---|---|---|---|
+| `[STORAGE_RAW]` | S3 raw 입력 (read-only) — Manager 가 listing/download 소스 | `s3://<ROOT>/<PREFIX>` (boto3 path 는 `/bucket/key`) | `s3://oncx-dev-common-assets-bucket/test/raw` |
+| `[STORAGE_CACHE]` | 로컬 작업 디렉토리 — Module 의 download 결과 + LocalPcapSplitter 출력 | 로컬 절대 path | `/data1/sensor-data-normalization/cache` |
+| `[STORAGE]` | S3 정규화 출력 — 1초 split 의 MID + pair merge 결과 | S3 path | `s3://oncx-dev-common-assets-bucket/test/split` |
+| `[STORAGE_UNPAIRED_MERGE]` | 로컬 임시 — HEAD/TAIL 짝 merge 중간 산출 | 로컬 절대 path | `/data1/sensor-data-normalization/unpaired_merge` |
 
 **라이프사이클 단위**
 

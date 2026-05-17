@@ -12,6 +12,7 @@ class ProjectConfig(AppConfig):
     class E_CATE_TYPE(IENUM):
         COMMON = "COMMON"
         STORAGE = "STORAGE"
+        STORAGE_RAW = "STORAGE_RAW"
         STORAGE_CACHE = "STORAGE_CACHE"
         STORAGE_UNPAIRED_MERGE = "STORAGE_UNPAIRED_MERGE"
         NORMALIZER = "NORMALIZER"
@@ -60,6 +61,14 @@ class ProjectConfig(AppConfig):
         )
         self.storage_prefix = self.get_config(
             ProjectConfig.E_CATE_TYPE.STORAGE, ProjectConfig.E_CATE_ELE_STORAGE.PREFIX
+        )
+        self.raw_storage_root = self.get_config(
+            ProjectConfig.E_CATE_TYPE.STORAGE_RAW,
+            ProjectConfig.E_CATE_ELE_STORAGE.ROOT,
+        )
+        self.raw_storage_prefix = self.get_config(
+            ProjectConfig.E_CATE_TYPE.STORAGE_RAW,
+            ProjectConfig.E_CATE_ELE_STORAGE.PREFIX,
         )
         self.cache_storage_root = self.get_config(
             ProjectConfig.E_CATE_TYPE.STORAGE_CACHE,
@@ -118,6 +127,9 @@ class ProjectConfig(AppConfig):
 
     def get_storage_full_path(self) -> str:
         return f"{self.storage_root}/{self.storage_prefix}"
+
+    def get_raw_storage_full_path(self) -> str:
+        return f"{self.raw_storage_root}/{self.raw_storage_prefix}"
 
     def get_cache_storage_full_path(self) -> str:
         return f"{self.cache_storage_root}/{self.cache_storage_prefix}"
