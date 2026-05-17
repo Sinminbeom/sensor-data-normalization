@@ -8,7 +8,7 @@ PCAP 기반 센서 데이터 정규화 파이프라인.
 uv sync
 
 # daemon — Redis Pub/Sub 채널 normalize_requests 를 SUBSCRIBE
-uv run python src/normalizer_app.py
+uv run python src/main.py
 ```
 
 워커 수는 `conf/application.conf` 의 `[NORMALIZER].WORKER_COUNT` 로 설정한다. argv 인자 없음 — 모든 정규화 입력(receiver / date / vehicle_id / selected_device / notify_channel)은 Redis pub/sub message body 에서 받는다 (아래 "외부 trigger" 참조).
@@ -23,15 +23,16 @@ redis-cli PUBLISH normalize_requests '{"receiver":"normalizer","date":"20260514"
 
 | 필드 | 필수 | 설명 |
 | --- | --- | --- |
+| `request_id` | | 생략 시 envelope parse 시점에 `req-YYYYMMDD-HHMMSS-{uuid8}` 자동 발급 |
 | `receiver` | ✅ | daemon 의 `[REDIS].RECEIVER` 와 일치해야 처리 (라우팅 키) |
 | `date` | ✅ | YYYYMMDD |
 | `vehicle_id` | | 빈 문자열이면 해당 날짜 전체 처리 |
 | `selected_device` | | 생략 시 conf `[SELECTED_DEVICE].SELECTED` |
 | `notify_channel` | | 생략 시 conf `[NOTIFICATION].DEFAULT_CHANNEL` |
 
-처리 시 daemon 이 `req-YYYYMMDD-HHMMSS-{uuid8}` 형식의 `request_id` 를 자동 발급하고, 완료/실패 시 Slack Incoming Webhook 으로 알림 전송.
+완료/실패 시 Slack Incoming Webhook 으로 알림 전송 (NormalizerManager 가 cycle 종료 후 직접 POST).
 
-> Pub/Sub 특성상 daemon 이 SUBSCRIBE 중이 아닌 시점의 message 는 손실됨 (재요청 필요). 손실 보호가 필요하면 Redis Stream + consumer group 으로 전환.
+> Pub/Sub 특성상 daemon 이 SUBSCRIBE 중이 아닌 시점의 message 는 손실됨 (재요청 필요). cycle 진행 중에도 Redis 클라이언트 버퍼가 메시지를 보유하지만 버퍼 크기 한계가 있음. 손실 보호가 필요하면 Redis Stream + consumer group 으로 전환.
 
 ## 디렉토리 구조
 
@@ -41,23 +42,20 @@ sensor-data-normalization/
 │   ├── application.conf
 │   └── logging.conf
 ├── src/
-│   ├── normalizer_app.py                # 진입점
+│   ├── main.py                          # 진입점 (config 로드 → ProcessCategory.register → app fork → run)
 │   ├── app/
 │   │   ├── app_object.py                # IApp / abApp / MultiProcessManagerApp[FromCate]
-│   │   ├── normalizer/process/          # 매 사이클 fork
-│   │   │   ├── manager/manager.py       # NormalizerManager (QueueProcessing, 파일 수집·잔여 sweep)
-│   │   │   └── module/module.py         # NormalizerModule (QueueProcessing, 다운로드/분할/업로드)
-│   │   └── communication/process/       # daemon 시작 시 영구 fork
-│   │       ├── consumer/consumer_process.py   # RequestConsumerProcess (poll → RequestQueue push)
-│   │       └── notifier/notifier_process.py   # NotifierProcess (NotificationQueue pop → Slack)
+│   │   └── normalizer/process/          # E_CATE.NORMALIZER — daemon 시작 시 영구 fork
+│   │       ├── manager/manager.py       # NormalizerManager (Redis sub poll + cycle 트리거 + Slack notify, listener/notifier 합성)
+│   │       └── module/module.py         # NormalizerModule × N (stateless 워커: shared_job_queue → 다운로드/분할/업로드, mark_one_done)
 │   ├── common/
-│   │   ├── event_bus/listener/normalization_request_listener.py  # pubsub.get_message + receiver 필터 (replayer event_bus/listener 패턴)
-│   │   ├── process_state/{pair_buckets, module_status, request_queue, notification_queue}.py  # cross-process 큐·상태
-│   │   ├── protocol/{normalization_request, request_id}.py # pydantic envelope + 시퀀스
-│   │   └── notification/{notification_sender, slack_webhook_notifier}.py  # Slack 알림
+│   │   ├── event_bus/listener/normalization_request_listener.py  # pubsub.get_message + receiver 필터 (Manager 가 composition 으로 사용)
+│   │   ├── process_state/{pair_buckets, job_progress}.py         # cross-process 상태 (PairBuckets / JobProgressTracker 카운터)
+│   │   ├── protocol/{normalization_request, request_id}.py       # pydantic envelope + 시퀀스
+│   │   └── notification/{notification_sender, slack_webhook_notifier}.py  # Slack 알림 (Manager 가 composition 으로 사용)
 │   ├── process_category/
-│   │   ├── enum_category.py             # E_CATE.NORMALIZER + E_CATE.COMMUNICATION
-│   │   └── process_category.py          # register_normalizer (워커 N 동적) + register_communication
+│   │   ├── enum_category.py             # E_CATE.NORMALIZER → COMMON(Manager) + MODULE(Module × N)
+│   │   └── process_category.py          # register_normalizer (worker_count 기반 module fanout)
 │   ├── sensor_category/
 │   │   ├── enum_sensor.py               # E_SENSOR_TYPE, E_LIDAR, E_CAMERA, E_GNSS
 │   │   └── sensor_registry.py           # SensorRegistry 싱글톤 (모듈명 → sensor_type)
@@ -84,57 +82,49 @@ flowchart LR
     Redis[(Redis Pub/Sub<br/>normalize_requests)]
     Slack["Slack Incoming<br/>Webhook"]
 
-    subgraph CommApp["Communication app — daemon 영구 fork"]
-        Consumer["RequestConsumerProcess<br/>SUBSCRIBE + receiver 필터<br/>+ envelope parse"]
-        Notifier["NotifierProcess<br/>Slack 발송"]
-    end
-
-    subgraph Main["main process"]
-        MainLoop["daemon loop<br/>RequestIdGenerator.next()<br/>NormalizerManager.configure<br/>register_normalizer"]
-    end
-
-    subgraph Cycle["Normalizer cycle — 매 요청마다 fork & join"]
-        Manager["NormalizerManager<br/>파일 수집<br/>모듈 종료 모니터링<br/>잔여 미페어 sweep"]
-        Modules["NormalizerModule x N<br/>다운로드 → 1초 split<br/>MID 업로드<br/>HEAD/TAIL → PairBuckets"]
+    subgraph App["E_CATE.NORMALIZER — daemon 시작 시 영구 fork (worker pool)"]
+        Manager["NormalizerManager<br/>① Redis pub/sub poll (listener 합성)<br/>② cycle 트리거 (파일 수집 + device 필터)<br/>③ job push + 완료 폴링<br/>④ 잔여 sweep + Slack notify (notifier 합성)"]
+        Modules["NormalizerModule × N<br/>stateless worker<br/>pop StorageFile<br/>다운로드 → 1초 split<br/>MID 업로드<br/>HEAD/TAIL → PairBuckets<br/>mark_one_done"]
         Storage[(S3 Storage<br/>via python_library.IStorage)]
 
         Manager -- "push_shared_job_queue" --> Modules
         Modules -- "PairBuckets<br/>(pair_key 완성 시 merge)" --> Modules
-        Manager <-- "ModuleStatusTracker" --> Modules
+        Manager <-- "JobProgressTracker<br/>(카운터)" --> Modules
         Modules <--> Storage
         Manager <--> Storage
     end
 
     Trigger -- "PUBLISH" --> Redis
-    Redis -- "message" --> Consumer
-    Consumer -- "push" --> RQ[["RequestQueue"]]
-    RQ -- "pop (block)" --> MainLoop
-    MainLoop -- "Normalizer(E_CATE.NORMALIZER).init/run<br/>join 까지 wait" --> Cycle
-    Cycle -- "사이클 완료" --> MainLoop
-    MainLoop -- "push NotificationEnvelope" --> NQ[["NotificationQueue"]]
-    NQ -- "pop" --> Notifier
-    Notifier -- "POST" --> Slack
+    Redis -- "SUBSCRIBE + receiver 필터" --> Manager
+    Manager -- "cycle 완료 후 POST" --> Slack
 ```
 
 **라이프사이클 단위**
 
 | 단위 | 무엇 | 언제 fork |
 |---|---|---|
-| **Communication app** (RequestConsumerProcess + NotifierProcess) | Redis pub/sub 수신 + Slack 발송 | daemon 시작 시 1회. 영구 |
-| **Normalizer cycle** (NormalizerManager + NormalizerModule × N) | 한 요청의 정규화 처리 | 매 요청마다 fork → join → 종료 |
-| **main process** | RequestQueue ↔ NotificationQueue 중재 + 사이클 트리거 | daemon 자체 |
+| **NormalizerManager** | Redis sub poll + cycle 오케스트레이션 + Slack notify (cycle 컨텍스트는 매 cycle 마다 instance field 로 set, ClassVar 없음) | daemon 시작 시 1회. 영구 |
+| **NormalizerModule × N** | shared_job_queue → 다운로드/split/업로드, stateless worker (cycle 컨텍스트는 file path 에서 derive) | daemon 시작 시 1회. 영구 |
+| **main process** | ProjectConfig + logging + cross-process singleton 부모 inherit | daemon 자체 (register + app.init/run 만) |
 
 ## 데이터 흐름
 
-1. `main()` → ProjectConfig + logging → `Communication(E_CATE.COMMUNICATION).init()` 으로 영구 process 2개 (RequestConsumerProcess + NotifierProcess) fork
-2. main loop: `RequestQueue.pop()` 대기
-3. `RequestConsumerProcess` 가 Redis pub/sub 채널 SUBSCRIBE → message 수신 → `NormalizationRequest` parse + receiver 필터 → `RequestQueue.push()`
-4. main: request_id 발급 → `NormalizerManager.configure(request_id, date, vehicle_id, selected_device)` (ClassVar)
-5. `ProcessCategory.register_normalizer()` (사이클별 재호출) → `Normalizer(E_CATE.NORMALIZER)` 인스턴스 → 매니저 1 + 모듈 N 사이클 fork
-6. `NormalizerManager`/`NormalizerModule` 가 처리 → 잔여 sweep → 모두 stop → `MultiProcessManager.join()`
-7. `Normalizer.run()` 의 `is_running()` 폴링이 끝남 → main 으로 복귀
-8. 결과를 `NotificationQueue.push(envelope)` → `NotifierProcess` 가 pop → Slack 발송
-9. 다음 요청 대기 (SIGTERM/SIGINT 시 graceful shutdown)
+1. `main()` → ProjectConfig + logging → `PairBuckets`/`JobProgressTracker` 부모 instance 화 (fork 시 자식 inherit) → `ProcessCategory.register_normalizer()` (worker_count 기반 트리 구성) → `Normalizer(E_CATE.NORMALIZER).init()` 으로 영구 process (Manager + Module × N) 일괄 fork → `app.run()`
+2. NormalizerManager.action(): `listener.poll(timeout=1.0)` 으로 Redis pub/sub 채널 polling. 메시지 없으면 다음 tick.
+3. 메시지 도착: `NormalizationRequest` parse (`request_id` 미지정 시 envelope `default_factory` 가 발급) + receiver 필터 통과
+4. Manager `_handle_request` → `_run_cycle`:
+   - `_collect_file_list(date, vehicle_id)` → S3 에서 파일 목록 수집
+   - `_filter_by_device(...)` → selected_device 로 필터
+   - `JobProgressTracker.begin_cycle(N)` → 카운터 세팅
+   - 각 StorageFile 을 `push_shared_job_queue` 로 push
+   - `_wait_for_completion()` → `progress.is_done()` 폴링
+5. NormalizerModule.action() (영구 루프):
+   - `pop_shared_job_queue()` → StorageFile 받음 (없으면 idle sleep)
+   - `_process_file` 다운로드 → 1초 split → MID 업로드 → HEAD/TAIL 은 PairBuckets 누적
+   - `JobProgressTracker.mark_one_done()`
+6. 카운터 0 도달 → Manager 가 `PairBuckets.pop_all_remaining()` 으로 잔여 sweep + 업로드
+7. Manager 가 `notifier.notify_success/_failure` 로 Slack 발송
+8. Manager.action() 복귀 → 다음 tick (Redis poll 재개). Module 들은 그대로 idle 상태로 대기.
 
 ## 동시성 모델
 
@@ -142,3 +132,6 @@ multi-process 채택. 벤치마크(`scripts/bench_io_vs_cpu.py`) 결과 합성 I
 process가 thread 대비 모든 worker count(1/2/4/8)에서 동등 또는 우세 (Python 표준
 파일 IO가 의외로 GIL-bound이기 때문). 워커 결선·종료는 `python_library.MultiProcessManager`
 의 자동 결선(`set_shared_job_queue` / `set_shared_queue` / `join`)을 그대로 사용.
+
+영구 워커 풀 패턴: Manager + Module × N 을 daemon 시작 시 **한 번만** fork 하고 영구 실행한다.
+요청마다 fork-join 하지 않으므로 fork overhead 가 사이클 latency 에 들어가지 않는다 (서버 모델).

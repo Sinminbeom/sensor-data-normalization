@@ -1,4 +1,9 @@
-"""NormalizerModule — PCAP 다운로드/분할/업로드 모듈 프로세스 (워커)."""
+"""NormalizerModule — PCAP 다운로드/분할/업로드 워커 프로세스.
+
+daemon 시작 시 한 번 fork → 영구 실행. shared_job_queue 에서 StorageFile 을 pop,
+다운로드 → 1초 split → MID 업로드 → HEAD/TAIL 은 PairBuckets 누적. cycle 컨텍스트는
+파일 경로에서 derive (vehicle_id 등) — cycle 별 상태 없음 (stateless worker).
+"""
 
 import logging
 import os
@@ -9,7 +14,7 @@ from python_library.storage.s3.s3_storage_factory import S3StorageFactory
 from python_library.storage.s3.s3_storage_info_factory import S3StorageInfoFactory
 from python_library.storage.storage import IStorage, StorageFile
 
-from common.process_state.module_status import ModuleStatusTracker
+from common.process_state.job_progress import JobProgressTracker
 from common.process_state.pair_buckets import PairBuckets
 from config.project_config import ProjectConfig
 from pcap.local_pcap_splitter import LocalPcapSplitter
@@ -32,7 +37,7 @@ class NormalizerModule(QueueProcessing):
         # 싱글톤은 부모 프로세스에서 즉시 instance() 호출 → 자식이 inherit.
         self._config = ProjectConfig.instance()
         self._pair_buckets = PairBuckets.instance()
-        self._status_tracker = ModuleStatusTracker.instance()
+        self._progress = JobProgressTracker.instance()
         self._storage: IStorage | None = None
         self._splitter: IPcapSplitter | None = None
         self._initialized = False
@@ -40,7 +45,6 @@ class NormalizerModule(QueueProcessing):
     # ---------- lifecycle ----------
 
     def on_init(self) -> None:
-        self._status_tracker.register(self._process_name)
         SensorRegistry.instance().register()
 
         self._storage = self._build_storage()
@@ -56,27 +60,17 @@ class NormalizerModule(QueueProcessing):
             self.on_init()
 
         assert self._storage is not None
-        try:
-            file_obj = self.pop_shared_job_queue()
-            if file_obj is None:
-                if self.size_shared_job_queue() == 0:
-                    self._logger.info(f"pid={os.getpid()} || {self._process_name} exit")
-                    self._status_tracker.mark_finished(self._process_name)
-                    self._storage.disconnect()
-                    self.stop()
-                    return
-                time.sleep(0.02)
-                return
-
-            self._process_file(file_obj)
+        file_obj = self.pop_shared_job_queue()
+        if file_obj is None:
             time.sleep(0.02)
+            return
+
+        try:
+            self._process_file(file_obj)
         except Exception as e:
             self._logger.error(f"pid={os.getpid()} || errMsg={e}")
-            try:
-                self._storage.disconnect()
-            finally:
-                self._status_tracker.mark_finished(self._process_name)
-                self.stop()
+        finally:
+            self._progress.mark_one_done()
 
     # ---------- job (jobQueue → download → split → upload) ----------
 
