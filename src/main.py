@@ -1,6 +1,7 @@
 """sensor-data-normalization 진입점."""
 
 import logging.config
+import multiprocessing
 import time
 
 from app.app_object import MultiProcessManagerAppFromCate
@@ -23,6 +24,12 @@ class Normalizer(MultiProcessManagerAppFromCate):
 
 
 def main() -> None:
+    # Python 3.14 부터 multiprocessing 기본 start_method 가 'spawn'. 본 프로젝트는
+    # 부모에서 instance() 호출 후 자식이 fork 로 class-level state 를 inherit 하는
+    # 패턴 (PairBuckets / JobProgressTracker / ProjectConfig / SensorRegistry) 에
+    # 의존하므로 fork 로 명시 (Linux 서버 환경 가정).
+    multiprocessing.set_start_method("fork", force=True)
+
     ProjectConfig.set_config(ProjectConfig.DEFAULT_CONFIG_PATH)
     logging.config.fileConfig(
         ProjectConfig.DEFAULT_LOGGING_CONFIG_PATH, disable_existing_loggers=False
