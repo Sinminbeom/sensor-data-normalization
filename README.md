@@ -7,6 +7,10 @@ PCAP 기반 센서 데이터 정규화 파이프라인.
 ```sh
 uv sync
 
+# (dev) replayer 의 raw 를 normalization 이 읽을 S3 RAW 구조로 업로드
+uv run python scripts/upload_raw_to_s3.py --dry-run   # 먼저 결과 path 확인
+uv run python scripts/upload_raw_to_s3.py             # 실제 업로드
+
 # daemon — Redis Pub/Sub 채널 normalize_requests 를 SUBSCRIBE
 uv run python src/main.py
 ```
@@ -30,7 +34,7 @@ redis-cli PUBLISH normalize_requests '{"receiver":"normalizer","date":"20260514"
 | `selected_device` | | 생략 시 conf `[SELECTED_DEVICE].SELECTED` |
 | `notify_channel` | | 생략 시 conf `[NOTIFICATION].DEFAULT_CHANNEL` |
 
-완료/실패 시 Slack Incoming Webhook 으로 알림 전송 (NormalizerManager 가 cycle 종료 후 직접 POST).
+완료/실패 시 `INotificationSender` 구현체가 알림 전송. **현재 개발 단계 기본값은 `LogNotifier`** — Slack 발송 없이 logger 로만 `[NOTIFY_SUCCESS]` / `[NOTIFY_FAILURE]` 기록. Slack 전환은 [manager.py](src/app/normalizer/process/manager/manager.py) 에서 `SlackWebhookNotifier()` 로 교체 + `conf [NOTIFICATION].WEBHOOK_URL` 실제 hook URL 입력.
 
 > Pub/Sub 특성상 daemon 이 SUBSCRIBE 중이 아닌 시점의 message 는 손실됨 (재요청 필요). cycle 진행 중에도 Redis 클라이언트 버퍼가 메시지를 보유하지만 버퍼 크기 한계가 있음. 손실 보호가 필요하면 Redis Stream + consumer group 으로 전환.
 
@@ -52,7 +56,7 @@ sensor-data-normalization/
 │   │   ├── event_bus/listener/normalization_request_listener.py  # pubsub.get_message + receiver 필터 (Manager 가 composition 으로 사용)
 │   │   ├── process_state/{pair_buckets, job_progress}.py         # cross-process 상태 (PairBuckets / JobProgressTracker 카운터)
 │   │   ├── protocol/{normalization_request, request_id}.py       # pydantic envelope + 시퀀스
-│   │   └── notification/{notification_sender, slack_webhook_notifier}.py  # Slack 알림 (Manager 가 composition 으로 사용)
+│   │   └── notification/{notification_sender, log_notifier, slack_webhook_notifier}.py  # 알림 (dev=LogNotifier, prod=SlackWebhookNotifier)
 │   ├── process_category/
 │   │   ├── enum_category.py             # E_CATE.NORMALIZER → COMMON(Manager) + MODULE(Module × N)
 │   │   └── process_category.py          # register_normalizer (worker_count 기반 module fanout)

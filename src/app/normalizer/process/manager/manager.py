@@ -25,8 +25,8 @@ from python_library.storage.storage_file import StorageFile
 from common.event_bus.listener.normalization_request_listener import (
     NormalizationRequestListener,
 )
+from common.notification.log_notifier import LogNotifier
 from common.notification.notification_sender import INotificationSender
-from common.notification.slack_webhook_notifier import SlackWebhookNotifier
 from common.process_state.job_progress import JobProgressTracker
 from common.process_state.pair_buckets import PairBuckets
 from common.protocol.normalization_request import NormalizationRequest
@@ -68,7 +68,9 @@ class NormalizerManager(QueueProcessing):
         self._storage.connect()
 
         self._listener = NormalizationRequestListener()
-        self._notifier = SlackWebhookNotifier()
+        # 개발 단계 기본값: 로그만. Slack 발송으로 전환하려면
+        # common.notification.slack_webhook_notifier.SlackWebhookNotifier 로 교체.
+        self._notifier = LogNotifier()
 
         self._initialized = True
         self._logger.info(
