@@ -102,11 +102,28 @@ class NormalizerManager(QueueProcessing):
         self._logger.info(f"[{request.request_id}] start | {summary}")
         try:
             self._run_cycle(request, selected_device)
-            self._notifier.notify_success(request.request_id, summary)
-            self._logger.info(f"[{request.request_id}] done")
         except Exception as e:
             self._logger.exception(f"[{request.request_id}] pipeline failed")
             self._notifier.notify_failure(request.request_id, summary, repr(e))
+            return
+
+        succeeded = self._progress.success_count()
+        failed = self._progress.failure_count()
+        total = succeeded + failed
+        if failed > 0:
+            self._logger.error(
+                f"[{request.request_id}] partial failure: {failed}/{total} job(s) failed"
+            )
+            self._notifier.notify_failure(
+                request.request_id,
+                summary,
+                error=f"partial failure: {failed}/{total} job(s) failed",
+            )
+            return
+        self._logger.info(
+            f"[{request.request_id}] done | {succeeded}/{total} job(s) succeeded"
+        )
+        self._notifier.notify_success(request.request_id, summary)
 
     def _run_cycle(
         self, request: NormalizationRequest, selected_device: str
