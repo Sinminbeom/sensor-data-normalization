@@ -123,7 +123,10 @@ class NormalizerModule(QueueProcessing):
                 continue
 
             src_path = os.path.abspath(piece.save_path)
-            dst_path = self._build_upload_dst_path(vehicle_id, piece)
+            dst_dir = self._build_upload_dst_path(vehicle_id, piece)
+            # dst 는 파일 path 여야 함 (boto3 upload_file 의 key 는 OBJECT 이름).
+            # 디렉토리만 넘기면 그 디렉토리 자체가 S3 객체로 박힘.
+            dst_path = f"{dst_dir}/{os.path.basename(piece.save_path)}"
             self._storage.upload(src_path, dst_path)
 
             if os.path.isfile(src_path):
@@ -140,7 +143,12 @@ class NormalizerModule(QueueProcessing):
 
             pair_key = self._build_pair_key(vehicle_id, piece)
             out_file_path = self._build_unpaired_out_path(vehicle_id, piece)
-            prefix_path = self._build_upload_dst_path(vehicle_id, piece)
+            # S3 dst 는 디렉토리 path + merge 결과 파일명 (boto3 upload_file 의 key 가
+            # OBJECT 의 정확한 이름이므로 디렉토리만 넘기면 그 자체가 객체로 박힘).
+            prefix_path = (
+                f"{self._build_upload_dst_path(vehicle_id, piece)}/"
+                f"{os.path.basename(out_file_path)}"
+            )
 
             unprocessed_pcap = UnprocessedPcap(
                 src_path=piece.save_path,
@@ -183,14 +191,17 @@ class NormalizerModule(QueueProcessing):
         return path
 
     def _build_split_out_template(self, vehicle_id: str, file_name: str) -> str:
-        # splitter 는 로컬 파일을 출력 (LocalPcapSplitter). base 는 cache (로컬). upload 시
-        # 이 로컬 결과를 _build_upload_dst_path (S3) 로 올린다.
+        # splitter 는 로컬 파일을 출력 (LocalPcapSplitter). base 는 cache (로컬).
+        # 파일명에 `_split_` 마커를 넣어 원본 다운로드 파일과 충돌 방지
+        # (마지막 second 의 split 결과가 원본과 같은 이름을 가지면 자기 자신을 덮어쓰고
+        #  _split_pcap 의 os.remove 가 split 결과를 삭제하는 버그).
         parts = PcapFilenameParser.parse(file_name)
         module_type = self._get_module_type(parts.module_name).lower()
         base = self._config.get_cache_storage_full_path()
         return (
             f"{base}/{vehicle_id}/{module_type}/{parts.module_name}/"
-            f"{parts.date}/{parts.hours}/{parts.minutes}/{parts.module_name}_{{}}.pcap"
+            f"{parts.date}/{parts.hours}/{parts.minutes}/"
+            f"{parts.module_name}_split_{{}}.pcap"
         )
 
     def _build_upload_dst_path(self, vehicle_id: str, piece: SplitedPcap) -> str:
