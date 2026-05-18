@@ -515,8 +515,8 @@ wheels = [
 
 [[package]]
 name = "python-library"
-version = "2.11.1"
-source = { git = "ssh://git@personal-github/Sinminbeom/python-library.git?tag=v2.11.1#247145d828082fc5557965ba0885a0d2009a5626" }
+version = "2.11.2"
+source = { git = "ssh://git@personal-github/Sinminbeom/python-library.git?tag=v2.11.2#4694a8a025161cdbd751f3449a0cce8ea5675bd1" }
 dependencies = [
     { name = "argon2-cffi" },
     { name = "boto3" },
@@ -647,7 +647,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "pydantic", specifier = ">=2.9.0" },
-    { name = "python-library", git = "ssh://git@personal-github/Sinminbeom/python-library.git?tag=v2.11.1" },
+    { name = "python-library", git = "ssh://git@personal-github/Sinminbeom/python-library.git?tag=v2.11.2" },
     { name = "redis", specifier = ">=7.1.0" },
     { name = "requests", specifier = ">=2.32.5" },
 ]
