@@ -1,53 +1,51 @@
-"""Redis Pub/Sub consumer — 정규화 요청 수신.
+"""Redis queue 기반 정규화 요청 수신 (LIST 자료형 + LPUSH/BRPOP 패턴).
 
-SUBSCRIBE 한 채널에서 message 받아 NormalizationRequest 로 parse 후 receiver 필터링.
-sensor-data-replayer 의 ImdgListener 패턴 차용 (pubsub.get_message 기반 non-blocking poll).
+외부 시스템이 LPUSH 한 메시지를 BRPOP 으로 blocking pop. Pub/Sub 와 달리 daemon 이
+대기 중이 아닐 때 들어온 메시지도 queue 에 영속, 다음 BRPOP 에서 꺼낸다.
 """
 
 import logging
-from typing import Any, cast
+from typing import cast
 
 import redis
-from redis.client import PubSub, Redis
+from redis.client import Redis
 
 from common.protocol.normalization_request import NormalizationRequest
 from config.project_config import ProjectConfig
 
 
 class NormalizationRequestListener:
-    """Redis Pub/Sub 기반 message poller.
+    """Redis queue (LIST) 기반 message poller.
 
-    poll() 호출마다 최대 1건 message 반환. None 이면 timeout 또는 receiver 불일치.
-    XACK 같은 ack 단계 없음 (pub/sub 의 특성).
+    poll() 호출마다 BRPOP 으로 최대 1건 message 반환. None 이면 timeout 또는 receiver
+    불일치 (mismatched 메시지는 destructive pop 으로 사라짐 — single daemon 시나리오
+    가정. 멀티 receiver 필요 시 queue 를 receiver 별로 분리할 것).
     """
 
     def __init__(self) -> None:
         config = ProjectConfig.instance()
         self._logger = logging.getLogger(ProjectConfig.LOGGER_BASE_NAME)
-        self._channel_name: str = config.redis_channel_name
+        self._queue_name: str = config.redis_channel_name
         self._receiver: str = config.redis_receiver
 
         self._redis: Redis = redis.StrictRedis(
             host=config.redis_host, port=config.redis_port
         )
-        self._pubsub: PubSub = self._redis.pubsub(ignore_subscribe_messages=True)
-        self._pubsub.subscribe(self._channel_name)
         self._logger.info(
-            f"subscribed to {self._channel_name} as receiver={self._receiver}"
+            f"polling queue {self._queue_name} as receiver={self._receiver}"
         )
 
     def poll(self, timeout_sec: float = 1.0) -> NormalizationRequest | None:
-        raw = cast(
-            dict[str, Any] | None,
-            self._pubsub.get_message(timeout=timeout_sec),
+        # BRPOP: timeout 이 int 단위. 0 이면 무한 대기 — 최소 1초 보장.
+        # redis-py stub 이 Awaitable union 형태라 cast 로 sync 결과 명시.
+        result = cast(
+            tuple[bytes, bytes] | None,
+            self._redis.brpop([self._queue_name], timeout=max(1, int(timeout_sec))),
         )
-        if raw is None or raw.get("type") != "message":
+        if result is None:
             return None
 
-        body = raw.get("data")
-        if not isinstance(body, (bytes, str)):
-            return None
-
+        _, body = result  # (queue name bytes, value bytes)
         try:
             request = NormalizationRequest.model_validate_json(body)
         except Exception as e:
@@ -55,14 +53,15 @@ class NormalizationRequestListener:
             return None
 
         if request.receiver != self._receiver:
-            # 다른 service 대상 메시지 — skip.
+            self._logger.warning(
+                f"dropping message: receiver={request.receiver} != {self._receiver}"
+            )
             return None
 
         return request
 
     def close(self) -> None:
         try:
-            self._pubsub.unsubscribe(self._channel_name)
-            self._pubsub.close()
+            self._redis.close()
         except Exception:
-            self._logger.exception("pubsub close failed")
+            self._logger.exception("redis close failed")
