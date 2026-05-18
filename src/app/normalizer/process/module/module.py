@@ -65,21 +65,26 @@ class NormalizerModule(QueueProcessing):
             time.sleep(0.02)
             return
 
+        success = True
         try:
             self._process_file(file_obj)
         except Exception as e:
-            self._logger.error(f"pid={os.getpid()} || errMsg={e}")
+            success = False
+            self._logger.error(
+                f"pid={os.getpid()} || file={file_obj.get_file_name()} errMsg={e}"
+            )
         finally:
-            self._progress.mark_one_done()
+            self._progress.mark_one_done(success=success)
 
     # ---------- job (jobQueue → download → split → upload) ----------
 
     def _process_file(self, file_obj: StorageFile) -> None:
+        # file_path 는 파일 자체의 전체 경로 (S3 key 포함). 도메인 컨벤션은
+        # `{raw_root}/{date_folder}/{VEHICLE_ID}/{file_name}` 이므로 vehicle_id 는
+        # path 의 끝에서 두 번째 segment.
         file_path = file_obj.get_file_path()
         file_name = file_obj.get_file_name()
-        # path 의 마지막 segment 가 vehicle_id 라는 도메인 컨벤션
-        # (`{cache_root}/{date_folder}/{vehicle_id}/{file_name}`).
-        vehicle_id = file_path.split("/")[-1]
+        vehicle_id = file_path.split("/")[-2]
 
         self._download(file_path, file_name, vehicle_id)
         outcome = self._split_pcap(file_name, vehicle_id)
@@ -95,7 +100,8 @@ class NormalizerModule(QueueProcessing):
     def _download(self, file_path: str, file_name: str, vehicle_id: str) -> None:
         assert self._storage is not None
         download_dst_path = self._build_download_dst_path(vehicle_id, file_name)
-        self._storage.download(f"{file_path}/{file_name}", download_dst_path)
+        # file_path 는 S3 src (파일 전체 경로), dst 는 로컬 디렉토리 + 파일명.
+        self._storage.download(file_path, f"{download_dst_path}/{file_name}")
 
     def _split_pcap(self, file_name: str, vehicle_id: str) -> SplitOutcome:
         assert self._splitter is not None
