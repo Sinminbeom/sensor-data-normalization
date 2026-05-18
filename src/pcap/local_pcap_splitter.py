@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import datetime as _dt
 import os
 
 from pcap.headers.packet_header import PacketHeader
@@ -44,12 +45,18 @@ class LocalPcapSplitter(IPcapSplitter):
         tail_second = sorted_seconds[-1]
 
         # 3) 각 second 그룹 → 별도 .pcap write.
+        # date/hours/minutes/second 는 원본 파일명이 아닌 패킷 epoch 에서 산출.
+        # 원본 파일명은 분 단위라 분 경계를 넘는 패킷의 wall-clock 을 표현 못함.
         processed: list[SplitedPcap] = []
         unprocessed: list[SplitedPcap] = []
 
         for second in sorted_seconds:
-            second_str = f"{second:02d}"[-2:]
-            timestamp_label = f"{parts.date}{parts.hours}{parts.minutes}{second_str}"
+            dt = _dt.datetime.fromtimestamp(second)
+            date_str = dt.strftime("%Y%m%d")
+            hours_str = dt.strftime("%H")
+            minutes_str = dt.strftime("%M")
+            second_str = dt.strftime("%S")
+            timestamp_label = f"{date_str}{hours_str}{minutes_str}{second_str}"
             save_path = out_template.format(timestamp_label)
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
@@ -59,9 +66,9 @@ class LocalPcapSplitter(IPcapSplitter):
             piece = SplitedPcap(
                 save_path=save_path,
                 module_name=parts.module_name,
-                date=parts.date,
-                hours=parts.hours,
-                minutes=parts.minutes,
+                date=date_str,
+                hours=hours_str,
+                minutes=minutes_str,
                 second=second_str,
                 position=position,
             )
