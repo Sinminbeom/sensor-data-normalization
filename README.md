@@ -11,18 +11,18 @@ uv sync
 uv run python scripts/upload_raw_to_s3.py --dry-run   # 먼저 결과 path 확인
 uv run python scripts/upload_raw_to_s3.py             # 실제 업로드
 
-# daemon — Redis Pub/Sub 채널 normalize_requests 를 SUBSCRIBE
+# daemon — Redis queue normalize_requests 를 BRPOP
 uv run python src/main.py
 ```
 
-워커 수는 `conf/application.conf` 의 `[NORMALIZER].WORKER_COUNT` 로 설정한다. argv 인자 없음 — 모든 정규화 입력(receiver / date / vehicle_id / selected_device / notify_channel)은 Redis pub/sub message body 에서 받는다 (아래 "외부 trigger" 참조).
+워커 수는 `conf/application.conf` 의 `[NORMALIZER].WORKER_COUNT` 로 설정한다. argv 인자 없음 — 모든 정규화 입력(receiver / date / vehicle_id / selected_device / notify_channel)은 Redis queue 메시지 body 에서 받는다 (아래 "외부 trigger" 참조).
 
-## 외부 trigger (Redis Pub/Sub message)
+## 외부 trigger (Redis queue)
 
-외부 시스템(Slack 명령/REST/CLI)이 conf `[REDIS].CHANNEL_NAME` 채널로 PUBLISH 하면 daemon 이 SUBSCRIBE 로 수신한다. `envelope.receiver` 가 daemon 의 conf `[REDIS].RECEIVER` 와 일치할 때만 처리. message body 는 pydantic `NormalizationRequest` schema 의 JSON.
+외부 시스템(Slack 명령/REST/CLI)이 conf `[REDIS].CHANNEL_NAME` 키 queue 에 `LPUSH` 하면 daemon 이 `BRPOP` 으로 꺼낸다. `envelope.receiver` 가 daemon 의 conf `[REDIS].RECEIVER` 와 일치할 때만 처리 (불일치 시 destructive pop + 로그 drop). message body 는 pydantic `NormalizationRequest` schema 의 JSON.
 
 ```sh
-redis-cli PUBLISH normalize_requests '{"receiver":"normalizer","date":"20260514","vehicle_id":"VEHICLE-001"}'
+redis-cli LPUSH normalize_requests '{"receiver":"normalizer","date":"20260514","vehicle_id":"VEHICLE-001"}'
 ```
 
 | 필드 | 필수 | 설명 |
@@ -36,7 +36,7 @@ redis-cli PUBLISH normalize_requests '{"receiver":"normalizer","date":"20260514"
 
 완료/실패 시 `INotificationSender` 구현체가 알림 전송. **현재 개발 단계 기본값은 `LogNotifier`** — Slack 발송 없이 logger 로만 `[NOTIFY_SUCCESS]` / `[NOTIFY_FAILURE]` 기록. Slack 전환은 [manager.py](src/app/normalizer/process/manager/manager.py) 에서 `SlackWebhookNotifier()` 로 교체 + `conf [NOTIFICATION].WEBHOOK_URL` 실제 hook URL 입력.
 
-> Pub/Sub 특성상 daemon 이 SUBSCRIBE 중이 아닌 시점의 message 는 손실됨 (재요청 필요). cycle 진행 중에도 Redis 클라이언트 버퍼가 메시지를 보유하지만 버퍼 크기 한계가 있음. 손실 보호가 필요하면 Redis Stream + consumer group 으로 전환.
+> queue (Redis LIST) 는 영속이라 daemon 이 down 인 동안 LPUSH 된 메시지도 다음 BRPOP 에서 그대로 꺼냄. ACK / 재처리 / replay 가 필요해지면 Redis Streams + consumer group 으로 전환 (현재 use case 는 단순 queue 로 충분).
 
 ## 디렉토리 구조
 
@@ -53,7 +53,7 @@ sensor-data-normalization/
 │   │       ├── manager/manager.py       # NormalizerManager (Redis sub poll + cycle 트리거 + Slack notify, listener/notifier 합성)
 │   │       └── module/module.py         # NormalizerModule × N (stateless 워커: shared_job_queue → 다운로드/분할/업로드, mark_one_done)
 │   ├── common/
-│   │   ├── event_bus/listener/normalization_request_listener.py  # pubsub.get_message + receiver 필터 (Manager 가 composition 으로 사용)
+│   │   ├── event_bus/listener/normalization_request_listener.py  # Redis queue BRPOP + receiver 필터 (Manager 가 composition 으로 사용)
 │   │   ├── process_state/{pair_buckets, job_progress}.py         # cross-process 상태 (PairBuckets / JobProgressTracker 카운터)
 │   │   ├── protocol/{normalization_request, request_id}.py       # pydantic envelope + 시퀀스
 │   │   └── notification/{notification_sender, log_notifier, slack_webhook_notifier}.py  # 알림 (dev=LogNotifier, prod=SlackWebhookNotifier)
@@ -83,7 +83,7 @@ sensor-data-normalization/
 ```mermaid
 flowchart LR
     Trigger["외부 trigger<br/>(Slack 명령 / REST / CLI)"]
-    Redis[(Redis Pub/Sub<br/>normalize_requests)]
+    Redis[(Redis queue<br/>normalize_requests)]
     Slack["Slack Incoming<br/>Webhook"]
 
     S3Raw[(S3 STORAGE_RAW<br/>read-only<br/>replayer 가 raw 업로드)]
@@ -91,7 +91,7 @@ flowchart LR
     S3Out[(S3 STORAGE<br/>1초 split 결과 출력)]
 
     subgraph App["E_CATE.NORMALIZER — daemon 시작 시 영구 fork (worker pool)"]
-        Manager["NormalizerManager<br/>① Redis pub/sub poll (listener 합성)<br/>② cycle 트리거 (RAW listing + device 필터)<br/>③ job push + 완료 폴링<br/>④ 잔여 sweep + Slack notify (notifier 합성)"]
+        Manager["NormalizerManager<br/>① Redis queue BRPOP (listener 합성)<br/>② cycle 트리거 (RAW listing + device 필터)<br/>③ job push + 완료 폴링<br/>④ 잔여 sweep + Slack notify (notifier 합성)"]
         Modules["NormalizerModule × N<br/>stateless worker<br/>pop StorageFile<br/>download(S3 RAW → 로컬 cache)<br/>1초 split (local)<br/>MID upload → S3 STORAGE<br/>HEAD/TAIL → PairBuckets<br/>mark_one_done"]
 
         Manager -- "push_shared_job_queue" --> Modules
@@ -105,8 +105,8 @@ flowchart LR
     Modules -- "upload" --> S3Out
     Manager -- "잔여 merge upload" --> S3Out
 
-    Trigger -- "PUBLISH" --> Redis
-    Redis -- "SUBSCRIBE + receiver 필터" --> Manager
+    Trigger -- "LPUSH" --> Redis
+    Redis -- "BRPOP + receiver 필터" --> Manager
     Manager -- "cycle 완료 후 POST" --> Slack
 ```
 
@@ -130,7 +130,7 @@ flowchart LR
 ## 데이터 흐름
 
 1. `main()` → ProjectConfig + logging → `PairBuckets`/`JobProgressTracker` 부모 instance 화 (fork 시 자식 inherit) → `ProcessCategory.register_normalizer()` (worker_count 기반 트리 구성) → `Normalizer(E_CATE.NORMALIZER).init()` 으로 영구 process (Manager + Module × N) 일괄 fork → `app.run()`
-2. NormalizerManager.action(): `listener.poll(timeout=1.0)` 으로 Redis pub/sub 채널 polling. 메시지 없으면 다음 tick.
+2. NormalizerManager.action(): `listener.poll(timeout=1.0)` 으로 Redis queue 에서 BRPOP. 메시지 없으면 다음 tick.
 3. 메시지 도착: `NormalizationRequest` parse (`request_id` 미지정 시 envelope `default_factory` 가 발급) + receiver 필터 통과
 4. Manager `_handle_request` → `_run_cycle`:
    - `_collect_file_list(date, vehicle_id)` → S3 에서 파일 목록 수집
