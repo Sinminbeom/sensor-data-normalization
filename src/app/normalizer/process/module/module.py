@@ -1,68 +1,79 @@
 """NormalizerModule — PCAP 다운로드/분할/업로드 워커 프로세스.
 
-daemon 시작 시 한 번 fork → 영구 실행. shared_job_queue 에서 StorageFile 을 pop,
-다운로드 → 1초 split → MID 업로드 → HEAD/TAIL 은 PairBuckets 누적. cycle 컨텍스트는
-파일 경로에서 derive (vehicle_id 등) — cycle 별 상태 없음 (stateless worker).
+daemon 시작 시 별도 프로세스 진입 → 영구 실행. shared_job_queue 에서
+StorageFile 을 pop, 다운로드 → 1초 split → MID 업로드. HEAD/TAIL 은 manager 의 mailbox
+로 PairPutMessage 송신. job 완료 시 JobDoneMessage 송신. cycle 컨텍스트는 파일 경로
+에서 derive (vehicle_id 등) — cycle 별 상태 없음 (stateless worker).
 """
 
-import logging
 import os
 import time
+from typing import ClassVar
 
+from python_library.logger.app_logger import AppLogger
 from python_library.process.queue_process import QueueProcessing
 from python_library.storage.s3.s3_storage_factory import S3StorageFactory
 from python_library.storage.s3.s3_storage_info_factory import S3StorageInfoFactory
 from python_library.storage.storage import IStorage, StorageFile
 
-from common.process_state.job_progress import JobProgressTracker
-from common.process_state.pair_buckets import PairBuckets
+from app.normalizer.process.manager.manager import NormalizerManager
 from config.project_config import ProjectConfig
 from pcap.local_pcap_splitter import LocalPcapSplitter
 from pcap.packet_position import E_PACKET_POSITION
 from pcap.pcap_filename_parser import PcapFilenameParser
 from pcap.splitter import IPcapSplitter, SplitedPcap, SplitOutcome
 from pcap.unprocessed_pcap import UnprocessedPcap
+from protocol.protocol_meta import E_PROTOCOL_ID, ProtocolMeta
 from sensor_category.enum_sensor import E_SENSOR_TYPE
 from sensor_category.sensor_registry import SensorRegistry
 
 
 class NormalizerModule(QueueProcessing):
-    def __init__(self, app_name: str, process_name: str):
+    _PROCESS_NAME_PREFIX: ClassVar[str] = "NORMALIZER_MODULE"
+    _IDLE_SLEEP_SEC = 0.02
+
+    def __init__(self, idx: int) -> None:
+        process_name = f"{NormalizerModule._PROCESS_NAME_PREFIX}_{idx}"
         super().__init__(name=process_name)
-        self._app_name = app_name
         self._process_name = process_name
-        self._logger = logging.getLogger(
-            f"{ProjectConfig.LOGGER_BASE_NAME}.{process_name}"
-        )
-        # 싱글톤은 부모 프로세스에서 즉시 instance() 호출 → 자식이 inherit.
-        self._config = ProjectConfig.instance()
-        self._pair_buckets = PairBuckets.instance()
-        self._progress = JobProgressTracker.instance()
+        # __init__ 에서 instance() 호출 없음 (fork-inherit 의존 없음). 모든 의존성은
+        # on_init 에서 setup. attribute 는 pickle 가능한 None 으로 시작 (spawn 호환).
         self._storage: IStorage | None = None
         self._splitter: IPcapSplitter | None = None
-        self._initialized = False
 
     # ---------- lifecycle ----------
 
+    def run(self) -> None:
+        # 자식 프로세스 진입 직후 1회. QueueProcessing.run() 의 while 루프를 그대로
+        # 유지하면서 on_init 만 앞에 추가.
+        self.on_init()
+        try:
+            while not self.is_stop():
+                self.action()
+        except Exception as e:
+            raise e
+
     def on_init(self) -> None:
+        ProjectConfig.set_config(ProjectConfig.DEFAULT_CONFIG_PATH)
+        # AppLogger 는 Singleton — 자식 프로세스 안에서 set_config 후 첫 `AppLogger.instance()`
+        # 호출 시점에 logging.conf 가 fileConfig 로 적용.
+        AppLogger.set_config(
+            ProjectConfig.DEFAULT_LOGGING_CONFIG_PATH,
+            f"{ProjectConfig.LOGGER_BASE_NAME}.{self._process_name}",
+        )
+
         SensorRegistry.instance().register()
 
         self._storage = self._build_storage()
         self._storage.connect()
-
         self._splitter = self._build_splitter()
 
-        self._initialized = True
-        self._logger.info(f"pid={os.getpid()} || {self._process_name} init")
+        AppLogger.instance().info(f"pid={os.getpid()} || {self._process_name} init")
 
     def action(self) -> None:
-        if not self._initialized:
-            self.on_init()
-
-        assert self._storage is not None
         file_obj = self.pop_shared_job_queue()
         if file_obj is None:
-            time.sleep(0.02)
+            time.sleep(NormalizerModule._IDLE_SLEEP_SEC)
             return
 
         success = True
@@ -70,11 +81,20 @@ class NormalizerModule(QueueProcessing):
             self._process_file(file_obj)
         except Exception as e:
             success = False
-            self._logger.error(
+            AppLogger.instance().error(
                 f"pid={os.getpid()} || file={file_obj.get_file_name()} errMsg={e}"
             )
         finally:
-            self._progress.mark_one_done(success=success)
+            self.push_shared_queue(
+                NormalizerManager.PROCESS_NAME,
+                ProtocolMeta.instance()
+                .get_factory(E_PROTOCOL_ID.WORKER_JOB_DONE.value)(
+                    sender=self._process_name,
+                    receiver=NormalizerManager.PROCESS_NAME,
+                    success=success,
+                )
+                .to_json(),
+            )
 
     # ---------- job (jobQueue → download → split → upload) ----------
 
@@ -90,7 +110,7 @@ class NormalizerModule(QueueProcessing):
         outcome = self._split_pcap(file_name, vehicle_id)
 
         self._upload_processed(vehicle_id, outcome.processed)
-        self._push_unprocessed_to_pair_buckets(vehicle_id, outcome.unprocessed)
+        self._send_unprocessed_to_manager(vehicle_id, outcome.unprocessed)
 
         parts = PcapFilenameParser.parse(file_name)
         module_type = self._get_module_type(parts.module_name)
@@ -132,9 +152,9 @@ class NormalizerModule(QueueProcessing):
             if os.path.isfile(src_path):
                 os.remove(src_path)
 
-    # ---------- pair bucket (HEAD/TAIL pair → merge → upload) ----------
+    # ---------- pair message (manager 단독 owner — worker 는 메시지 송신만) ----------
 
-    def _push_unprocessed_to_pair_buckets(
+    def _send_unprocessed_to_manager(
         self, vehicle_id: str, unprocessed: list[SplitedPcap]
     ) -> None:
         for piece in unprocessed:
@@ -156,32 +176,24 @@ class NormalizerModule(QueueProcessing):
                 prefix_path=prefix_path,
             )
 
-            paired = self._pair_buckets.put(pair_key, unprocessed_pcap)
-            if paired is not None:
-                self._merge_pair(paired)
-
-    def _merge_pair(self, paired_list: list[UnprocessedPcap]) -> None:
-        assert self._storage is not None
-        assert self._splitter is not None
-        pcap_files = [item.src_path for item in paired_list]
-        out_file_path = paired_list[0].out_file_path
-        prefix_path = paired_list[0].prefix_path
-
-        self._splitter.merge_pcap_files(pcap_files, out_file_path)
-        self._storage.upload(out_file_path, prefix_path)
-
-        if os.path.isfile(out_file_path):
-            os.remove(out_file_path)
-        for f in pcap_files:
-            if os.path.isfile(f):
-                os.remove(f)
+            self.push_shared_queue(
+                NormalizerManager.PROCESS_NAME,
+                ProtocolMeta.instance()
+                .get_factory(E_PROTOCOL_ID.WORKER_PAIR_PUT.value)(
+                    sender=self._process_name,
+                    receiver=NormalizerManager.PROCESS_NAME,
+                    pair_key=pair_key,
+                    item=unprocessed_pcap,
+                )
+                .to_json(),
+            )
 
     # ---------- path builders ----------
 
     def _build_download_dst_path(self, vehicle_id: str, file_name: str) -> str:
         parts = PcapFilenameParser.parse(file_name)
         module_type = self._get_module_type(parts.module_name).lower()
-        base = self._config.get_cache_storage_full_path()
+        base = ProjectConfig.instance().get_cache_storage_full_path()
         path = (
             f"{base}/{vehicle_id}/{module_type}/{parts.module_name}/"
             f"{parts.date}/{parts.hours}/{parts.minutes}"
@@ -197,7 +209,7 @@ class NormalizerModule(QueueProcessing):
         #  _split_pcap 의 os.remove 가 split 결과를 삭제하는 버그).
         parts = PcapFilenameParser.parse(file_name)
         module_type = self._get_module_type(parts.module_name).lower()
-        base = self._config.get_cache_storage_full_path()
+        base = ProjectConfig.instance().get_cache_storage_full_path()
         return (
             f"{base}/{vehicle_id}/{module_type}/{parts.module_name}/"
             f"{parts.date}/{parts.hours}/{parts.minutes}/"
@@ -206,7 +218,7 @@ class NormalizerModule(QueueProcessing):
 
     def _build_upload_dst_path(self, vehicle_id: str, piece: SplitedPcap) -> str:
         module_type = self._get_module_type(piece.module_name).lower()
-        base = self._config.get_storage_full_path()
+        base = ProjectConfig.instance().get_storage_full_path()
         return (
             f"{base}/{vehicle_id}/{module_type}/{piece.module_name}/"
             f"{piece.date}/{piece.hours}/{piece.minutes}"
@@ -220,7 +232,7 @@ class NormalizerModule(QueueProcessing):
 
     def _build_unpaired_out_path(self, vehicle_id: str, piece: SplitedPcap) -> str:
         module_type = self._get_module_type(piece.module_name).lower()
-        base = self._config.get_unpaired_merge_full_path()
+        base = ProjectConfig.instance().get_unpaired_merge_full_path()
         dir_path = (
             f"{base}/{vehicle_id}/{module_type}/{piece.module_name}/"
             f"{piece.date}/{piece.hours}/{piece.minutes}"

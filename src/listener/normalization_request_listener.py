@@ -4,14 +4,18 @@
 대기 중이 아닐 때 들어온 메시지도 queue 에 영속, 다음 BRPOP 에서 꺼낸다.
 """
 
-import logging
+import re
 from typing import cast
 
 import redis
+from python_library.logger.app_logger import AppLogger
 from redis.client import Redis
 
-from common.protocol.normalization_request import NormalizationRequest
 from config.project_config import ProjectConfig
+from protocol.normalization_request import NormalizationRequest
+from protocol.protocol_meta import E_PROTOCOL_ID, ProtocolMeta
+
+_DATE_PATTERN = re.compile(r"\d{8}")
 
 
 class NormalizationRequestListener:
@@ -24,14 +28,13 @@ class NormalizationRequestListener:
 
     def __init__(self) -> None:
         config = ProjectConfig.instance()
-        self._logger = logging.getLogger(ProjectConfig.LOGGER_BASE_NAME)
         self._queue_name: str = config.redis_channel_name
         self._receiver: str = config.redis_receiver
 
         self._redis: Redis = redis.StrictRedis(
             host=config.redis_host, port=config.redis_port
         )
-        self._logger.info(
+        AppLogger.instance().info(
             f"polling queue {self._queue_name} as receiver={self._receiver}"
         )
 
@@ -47,14 +50,25 @@ class NormalizationRequestListener:
 
         _, body = result  # (queue name bytes, value bytes)
         try:
-            request = NormalizationRequest.model_validate_json(body)
+            request = cast(
+                NormalizationRequest,
+                ProtocolMeta.instance().get_decoder(
+                    E_PROTOCOL_ID.NORMALIZATION_REQUEST.value
+                )(body.decode("utf-8")),
+            )
         except Exception as e:
-            self._logger.error(f"failed to parse request envelope: {e}")
+            AppLogger.instance().error(f"failed to parse request envelope: {e}")
             return None
 
         if request.receiver != self._receiver:
-            self._logger.warning(
+            AppLogger.instance().warning(
                 f"dropping message: receiver={request.receiver} != {self._receiver}"
+            )
+            return None
+
+        if not _DATE_PATTERN.fullmatch(request.date):
+            AppLogger.instance().error(
+                f"dropping message: invalid date format (expect YYYYMMDD): {request.date!r}"
             )
             return None
 
@@ -64,4 +78,4 @@ class NormalizationRequestListener:
         try:
             self._redis.close()
         except Exception:
-            self._logger.exception("redis close failed")
+            AppLogger.instance().exception("redis close failed")

@@ -1,12 +1,12 @@
 """Slack Incoming Webhook 기반 알림."""
 
 import json
-import logging
 
 import requests
+from python_library.logger.app_logger import AppLogger
 
-from common.notification.notification_sender import INotificationSender
 from config.project_config import ProjectConfig
+from notification.notification_sender import INotificationSender
 
 
 class SlackWebhookNotifier(INotificationSender):
@@ -19,7 +19,6 @@ class SlackWebhookNotifier(INotificationSender):
         config = ProjectConfig.instance()
         self._webhook_url: str = config.notification_webhook_url
         self._channel: str = config.notification_default_channel
-        self._logger = logging.getLogger(ProjectConfig.LOGGER_BASE_NAME)
 
     def notify_success(self, request_id: str, summary: str) -> None:
         text = f":white_check_mark: *{request_id}* 완료\n{summary}"
@@ -31,7 +30,7 @@ class SlackWebhookNotifier(INotificationSender):
 
     def _post(self, text: str) -> None:
         if not self._webhook_url:
-            self._logger.info(f"slack webhook empty, skip notify: {text}")
+            AppLogger.instance().info(f"slack webhook empty, skip notify: {text}")
             return
         try:
             requests.post(
@@ -41,4 +40,4 @@ class SlackWebhookNotifier(INotificationSender):
                 timeout=5,
             )
         except Exception:
-            self._logger.exception("slack webhook failed")
+            AppLogger.instance().exception("slack webhook failed")
